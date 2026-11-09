@@ -6,6 +6,7 @@ use std::{
 use futures_channel::{mpsc, oneshot};
 use futures_util::{
     future::{select, Either},
+    stream::FusedStream,
     StreamExt,
 };
 use js_sys::Uint8Array;
@@ -31,11 +32,6 @@ enum Phase {
     Closed(Result<(), String>),
 }
 
-enum WorkerEvent {
-    Message(Vec<u8>),
-    Failed(String),
-}
-
 struct Session {
     worker: Worker,
     _message: Closure<dyn FnMut(MessageEvent)>,
@@ -44,25 +40,26 @@ struct Session {
 }
 
 impl Session {
-    fn new(worker: Worker) -> (Self, mpsc::UnboundedReceiver<WorkerEvent>) {
+    fn new(worker: Worker) -> (Self, mpsc::UnboundedReceiver<Result<Response, String>>) {
         let (events, receiver) = mpsc::unbounded();
         let messages = events.clone();
         let message = Closure::new(move |event: MessageEvent| {
-            let event = match event.data().dyn_into::<Uint8Array>() {
-                Ok(bytes) => WorkerEvent::Message(bytes.to_vec()),
-                Err(_) => WorkerEvent::Failed("database reply must contain a Uint8Array".into()),
-            };
-            let _ = messages.unbounded_send(event);
+            let response = event
+                .data()
+                .dyn_into::<Uint8Array>()
+                .map_err(|_| "database reply must contain a Uint8Array".to_owned())
+                .and_then(|bytes| {
+                    postcard::from_bytes(&bytes.to_vec()).map_err(|error| error.to_string())
+                });
+            let _ = messages.unbounded_send(response);
         });
         let errors = events.clone();
         let error = Closure::new(move |event: ErrorEvent| {
             event.prevent_default();
-            let _ = errors.unbounded_send(WorkerEvent::Failed(event.message()));
+            let _ = errors.unbounded_send(Err(event.message()));
         });
         let message_error = Closure::new(move |_: Event| {
-            let _ = events.unbounded_send(WorkerEvent::Failed(
-                "database reply could not be received".into(),
-            ));
+            let _ = events.unbounded_send(Err("database reply could not be received".into()));
         });
         worker.set_onmessage(Some(message.as_ref().unchecked_ref()));
         worker.set_onerror(Some(error.as_ref().unchecked_ref()));
@@ -113,15 +110,9 @@ impl Backend {
         let ready = async {
             session.send(&Request::Hello)?;
             match events.next().await {
-                Some(WorkerEvent::Message(bytes)) => match postcard::from_bytes(&bytes) {
-                    Ok(Response::Ready) => {}
-                    Ok(Response::StartupError(reason) | Response::Failed(reason)) => {
-                        return Err(reason)
-                    }
-                    Ok(_) => return Err("database sent a reply before readiness".into()),
-                    Err(error) => return Err(error.to_string()),
-                },
-                Some(WorkerEvent::Failed(reason)) => return Err(reason),
+                Some(Ok(Response::Ready)) => {}
+                Some(Ok(Response::Failed(reason)) | Err(reason)) => return Err(reason),
+                Some(Ok(_)) => return Err("database sent a reply before readiness".into()),
                 None => return Err("database worker disconnected during startup".into()),
             }
             Ok(())
@@ -134,7 +125,6 @@ impl Backend {
             session,
             events,
             commands: receiver,
-            commands_open: true,
             phase: phase.clone(),
             pending: HashMap::new(),
             next_id: 0,
@@ -227,18 +217,12 @@ fn finish(phase: &mut Phase, result: Result<(), String>) {
 
 struct Bridge {
     session: Session,
-    events: mpsc::UnboundedReceiver<WorkerEvent>,
+    events: mpsc::UnboundedReceiver<Result<Response, String>>,
     commands: mpsc::UnboundedReceiver<Command>,
-    commands_open: bool,
     phase: Arc<Mutex<Phase>>,
     pending: HashMap<u64, Reply>,
     next_id: u64,
     close_sent: bool,
-}
-
-enum Incoming {
-    Event(Option<WorkerEvent>),
-    Command(Option<Command>),
 }
 
 impl Bridge {
@@ -271,44 +255,38 @@ impl Bridge {
 
     async fn process(&mut self) -> Result<(), String> {
         loop {
-            let command = if self.commands_open {
+            let command = if !self.commands.is_terminated() {
                 Either::Left(self.commands.next())
             } else {
                 Either::Right(core::future::pending())
             };
             let incoming = match select(self.events.next(), command).await {
-                Either::Left((event, _)) => Incoming::Event(event),
-                Either::Right((command, _)) => Incoming::Command(command),
+                Either::Left((event, _)) => Either::Left(event),
+                Either::Right((command, _)) => Either::Right(command),
             };
             match incoming {
-                Incoming::Event(Some(WorkerEvent::Message(bytes))) => {
-                    match postcard::from_bytes::<Response>(&bytes)
-                        .map_err(|error| error.to_string())?
-                    {
-                        Response::Ready => {}
-                        Response::Reply { id, result } => {
-                            let reply = self
-                                .pending
-                                .remove(&id)
-                                .ok_or("database replied to an unknown request")?;
-                            let _ = reply.send(result.map_err(Into::into));
-                        }
-                        Response::Closed(result) => {
-                            if !self.close_sent || !self.pending.is_empty() {
-                                return Err(
-                                    "database closed before replying to accepted requests".into()
-                                );
-                            }
-                            return result;
-                        }
-                        Response::StartupError(reason) | Response::Failed(reason) => {
-                            return Err(reason)
-                        }
+                Either::Left(Some(Ok(response))) => match response {
+                    Response::Ready => {}
+                    Response::Reply { id, result } => {
+                        let reply = self
+                            .pending
+                            .remove(&id)
+                            .ok_or("database replied to an unknown request")?;
+                        let _ = reply.send(result.map_err(Into::into));
                     }
-                }
-                Incoming::Event(Some(WorkerEvent::Failed(reason))) => return Err(reason),
-                Incoming::Event(None) => return Err("database worker disconnected".into()),
-                Incoming::Command(Some(Command::Call { request, reply })) => {
+                    Response::Closed(result) => {
+                        if !self.close_sent || !self.pending.is_empty() {
+                            return Err(
+                                "database closed before replying to accepted requests".into()
+                            );
+                        }
+                        return result;
+                    }
+                    Response::Failed(reason) => return Err(reason),
+                },
+                Either::Left(Some(Err(reason))) => return Err(reason),
+                Either::Left(None) => return Err("database worker disconnected".into()),
+                Either::Right(Some(Command::Call { request, reply })) => {
                     let id = self.next_id;
                     self.next_id = match id.checked_add(1) {
                         Some(next) => next,
@@ -331,14 +309,11 @@ impl Bridge {
                         }
                     }
                 }
-                Incoming::Command(Some(Command::Close)) => self.send_close()?,
-                Incoming::Command(Some(Command::Terminate)) => {
+                Either::Right(Some(Command::Close)) => self.send_close()?,
+                Either::Right(Some(Command::Terminate)) => {
                     return Err("database worker terminated".into())
                 }
-                Incoming::Command(None) => {
-                    self.commands_open = false;
-                    self.send_close()?;
-                }
+                Either::Right(None) => self.send_close()?,
             }
         }
     }

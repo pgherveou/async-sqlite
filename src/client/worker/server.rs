@@ -10,7 +10,7 @@ use super::wire::{Request, Response};
 
 struct Listener {
     scope: DedicatedWorkerGlobalScope,
-    messages: mpsc::UnboundedReceiver<Result<Vec<u8>, String>>,
+    messages: mpsc::UnboundedReceiver<Result<Request, String>>,
     _message: Closure<dyn FnMut(MessageEvent)>,
     _message_error: Closure<dyn FnMut(Event)>,
 }
@@ -21,12 +21,14 @@ impl Listener {
         let (sender, receiver) = mpsc::unbounded();
         let errors = sender.clone();
         let message = Closure::new(move |event: MessageEvent| {
-            let bytes = event
+            let request = event
                 .data()
                 .dyn_into::<Uint8Array>()
-                .map(|bytes| bytes.to_vec())
-                .map_err(|_| "database request must contain a Uint8Array".to_owned());
-            let _ = sender.unbounded_send(bytes);
+                .map_err(|_| "database request must contain a Uint8Array".to_owned())
+                .and_then(|bytes| {
+                    postcard::from_bytes(&bytes.to_vec()).map_err(|error| error.to_string())
+                });
+            let _ = sender.unbounded_send(request);
         });
         let message_error = Closure::new(move |_: Event| {
             let _ = errors.unbounded_send(Err("database request could not be received".into()));
@@ -78,10 +80,7 @@ pub async fn serve_with_shutdown(
 ) -> Result<(), JsValue> {
     let mut listener = Listener::new()?;
     listener.send(&Response::Ready)?;
-    while let Some(message) = listener.messages.next().await {
-        let request = message.and_then(|bytes| {
-            postcard::from_bytes::<Request>(&bytes).map_err(|error| error.to_string())
-        });
+    while let Some(request) = listener.messages.next().await {
         match request {
             Ok(Request::Hello) => listener.send(&Response::Ready)?,
             Ok(Request::Call { id, request }) => {
@@ -114,10 +113,10 @@ pub async fn serve_with_shutdown(
 /// caller terminates the failed worker after receiving the failure.
 pub async fn report_startup_error(message: String) -> Result<(), JsValue> {
     let mut listener = Listener::new()?;
-    listener.send(&Response::StartupError(message.clone()))?;
-    while let Some(Ok(bytes)) = listener.messages.next().await {
-        if matches!(postcard::from_bytes::<Request>(&bytes), Ok(Request::Hello)) {
-            listener.send(&Response::StartupError(message))?;
+    listener.send(&Response::Failed(message.clone()))?;
+    while let Some(request) = listener.messages.next().await {
+        if matches!(request, Ok(Request::Hello)) {
+            listener.send(&Response::Failed(message))?;
             return Ok(());
         }
     }

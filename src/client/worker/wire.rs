@@ -15,7 +15,6 @@ pub enum Request {
 #[derive(Serialize, Deserialize)]
 pub enum Response {
     Ready,
-    StartupError(String),
     Reply {
         id: u64,
         result: Result<sql::Response, SqlError>,
