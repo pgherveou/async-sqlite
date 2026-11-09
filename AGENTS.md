@@ -34,18 +34,7 @@ The library has three core types in `src/`:
 
 The Client and Pool APIs use closures (e.g., `conn(|conn| { ... })`) to avoid lifetime issues with the cross-thread boundary. Both blocking and async variants exist for these operations.
 
-The optional typed service has a separate ownership contract: once a request is
-admitted, dropping its caller does not cancel it. `src/database.rs` defines
-`DatabaseBackend` and `CallError`; `src/database/native.rs` dispatches owned work
-through the existing `Client`. Keep the closure API's cancellation semantics
-unchanged. Native close and request admission must be serialized across clones.
-
-`src/worker/` implements the browser caller bridge, worker endpoint and postcard
-wire envelopes. The `WorkerDatabase` handle owns channels and admission state;
-JavaScript objects remain on their owning event loop. The database worker runs
-the application's compiled Rust handler and owns its connection. A lost reply
-can follow a committed transaction, so report an unknown outcome and never
-automatically replay requests.
+`src/database.rs` defines the optional typed service; `src/database/native.rs` uses Client threads and `src/worker/` uses browser workers. Admitted service requests survive caller cancellation. Preserve the closure API's separate cancellation behavior; never replay requests after an unknown outcome.
 
 ## Features
 
@@ -59,9 +48,4 @@ Version 0.7.0 uses rusqlite 0.41. The library exposes rusqlite types in its publ
 
 Tests in `tests/tests.rs` use a `async_test!` macro that generates two variants of each async test: one running on tokio and one on smol. This ensures runtime compatibility. Tests use `tempfile` for temporary database files.
 
-`tests/database.rs` verifies service dispatch, transaction and shutdown contracts.
-`examples/worker-ledger` shares a Rust handler between native tests and real
-browser workers. `scripts/test-worker.cjs` checks worker isolation, OPFS durability
-and lost replies. Run service tests with `cargo test --features service`; follow
-the [README](README.md#testing-database-services) for browser tooling and commands.
-Keep fault injection in the example harness, never in the transport library.
+`tests/database.rs` covers the typed service. `examples/worker-ledger` shares a handler between native tests and `scripts/test-worker.cjs`. Keep fault injection in the example; see [README](README.md#typed-database-services) for test commands.
