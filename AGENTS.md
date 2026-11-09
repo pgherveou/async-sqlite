@@ -34,7 +34,7 @@ The library has three core types in `src/`:
 
 Native Client and Pool retain closure methods (e.g., `conn(|conn| { ... })`) with blocking and async variants.
 
-Admitted SQL requests survive caller cancellation; queued native closure calls retain their cancellation behavior. Keep transport commands internal. Row mappers run on the caller, and each SQL request must finish its transaction. Never replay requests after an unknown outcome.
+Admitted SQL requests survive caller cancellation; queued native closure calls retain their cancellation behavior. Native async and blocking close share shutdown admission. Keep transport commands internal. Row mappers run on the caller, and each SQL request must finish its transaction. Never replay requests after an unknown outcome.
 
 ## Features
 

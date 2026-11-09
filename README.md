@@ -43,6 +43,7 @@ println!("Value is: {value}");
 ```
 
 Native `conn` calls canceled before the worker starts them are skipped.
+Both close methods reject new SQL before draining accepted work.
 `ClientBuilder::queue_capacity()` and
 `PoolBuilder::queue_capacity()` can be used to bound worker queues; operations
 return `Error::QueueFull` when the selected queue is full.

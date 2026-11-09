@@ -12,10 +12,6 @@ use crate::Error;
 
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender, TrySendError};
 use futures_channel::oneshot;
-use futures_util::{
-    future::{BoxFuture, Shared},
-    FutureExt,
-};
 use rusqlite::{Connection, OpenFlags};
 
 /// A `ClientBuilder` can be used to create a [`Client`] with custom
@@ -126,115 +122,15 @@ impl ClientBuilder {
 }
 
 enum Command {
-    Func(Box<dyn QueuedFunc>),
-    Shutdown(Box<dyn QueuedShutdown>),
-}
-
-trait QueuedFunc: Send {
-    fn is_canceled(&self) -> bool;
-    fn execute(self: Box<Self>, conn: &mut Connection);
-}
-
-impl<F> QueuedFunc for F
-where
-    F: FnOnce(&mut Connection) + Send,
-{
-    fn is_canceled(&self) -> bool {
-        false
-    }
-
-    fn execute(self: Box<Self>, conn: &mut Connection) {
-        self(conn);
-    }
-}
-
-struct AsyncFunc<F, T, E> {
-    tx: oneshot::Sender<Result<T, E>>,
-    func: F,
-}
-
-impl<F, T, E> QueuedFunc for AsyncFunc<F, T, E>
-where
-    F: FnOnce(&mut Connection) -> Result<T, E> + Send + 'static,
-    T: Send + 'static,
-    E: Send + 'static,
-{
-    fn is_canceled(&self) -> bool {
-        self.tx.is_canceled()
-    }
-
-    fn execute(self: Box<Self>, conn: &mut Connection) {
-        let Self { tx, func } = *self;
-        _ = tx.send(func(conn));
-    }
-}
-
-struct BlockingFunc<F, T, E> {
-    tx: Sender<Result<T, E>>,
-    func: F,
-}
-
-impl<F, T, E> QueuedFunc for BlockingFunc<F, T, E>
-where
-    F: FnOnce(&mut Connection) -> Result<T, E> + Send + 'static,
-    T: Send + 'static,
-    E: Send + 'static,
-{
-    fn is_canceled(&self) -> bool {
-        false
-    }
-
-    fn execute(self: Box<Self>, conn: &mut Connection) {
-        let Self { tx, func } = *self;
-        _ = tx.send(func(conn));
-    }
-}
-
-trait QueuedShutdown: Send {
-    fn is_canceled(&self) -> bool;
-    fn respond(self: Box<Self>, res: Result<(), Error>);
-}
-
-impl<F> QueuedShutdown for F
-where
-    F: FnOnce(Result<(), Error>) + Send,
-{
-    fn is_canceled(&self) -> bool {
-        false
-    }
-
-    fn respond(self: Box<Self>, result: Result<(), Error>) {
-        self(result);
-    }
-}
-
-struct BlockingShutdown {
-    tx: Sender<Result<(), Error>>,
-}
-
-impl QueuedShutdown for BlockingShutdown {
-    fn is_canceled(&self) -> bool {
-        false
-    }
-
-    fn respond(self: Box<Self>, res: Result<(), Error>) {
-        _ = self.tx.send(res);
-    }
+    Func(Box<dyn FnOnce(&mut Connection) + Send>),
+    Shutdown,
 }
 
 fn run_catching<F, T>(conn: &mut Connection, func: F) -> Result<T, Error>
 where
     F: FnOnce(&mut Connection) -> Result<T, rusqlite::Error>,
 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| func(conn))) {
-        Ok(res) => res.map_err(Error::from),
-        Err(p) => {
-            rollback_if_needed(conn);
-            Err(Error::Panic {
-                message: panic_message(&*p),
-            })
-        }
-    }
+    run_catching_and_then(conn, |conn| func(conn).map_err(Error::from))
 }
 
 fn run_catching_and_then<F, T, E>(conn: &mut Connection, func: F) -> Result<T, E>
@@ -269,25 +165,37 @@ fn panic_message(p: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-type CloseResult = Shared<BoxFuture<'static, Result<(), String>>>;
+type CloseReply = Box<dyn FnOnce(Result<(), Error>) + Send>;
 
 enum Admission {
     Open,
-    Closing(CloseResult),
+    Closing(Vec<CloseReply>),
     Closed,
 }
 
-impl Admission {
-    fn refresh(&mut self) {
-        if let Self::Closing(reply) = self {
-            if let Some(result) = reply.clone().now_or_never() {
-                *self = if result.is_ok() {
-                    Self::Closed
-                } else {
-                    Self::Open
-                };
-            }
+fn finish_close(admission: &Mutex<Admission>, result: rusqlite::Result<()>) {
+    let replies = {
+        let mut admission = admission.lock().expect("database admission poisoned");
+        let next = if result.is_ok() {
+            Admission::Closed
+        } else {
+            Admission::Open
+        };
+        match core::mem::replace(&mut *admission, next) {
+            Admission::Closing(replies) => replies,
+            _ => unreachable!("database close was not admitted"),
         }
+    };
+    for reply in replies {
+        reply(match &result {
+            Ok(()) => Ok(()),
+            Err(rusqlite::Error::SqliteFailure(error, message)) => {
+                Err(rusqlite::Error::SqliteFailure(*error, message.clone()).into())
+            }
+            Err(error) => Err(Error::OutcomeUnknown {
+                message: error.to_string(),
+            }),
+        });
     }
 }
 
@@ -333,36 +241,39 @@ impl Backend {
                 }
             };
 
+            let admission = Arc::new(Mutex::new(Admission::Open));
             let client = Client {
                 backend: Self {
                     conn_tx,
-                    admission: Arc::new(Mutex::new(Admission::Open)),
+                    admission: admission.clone(),
                 },
             };
             func(Ok(client));
 
-            while let Ok(cmd) = conn_rx.recv() {
-                match cmd {
-                    Command::Func(func) => {
-                        if !func.is_canceled() {
-                            func.execute(&mut conn);
-                        }
-                    }
-                    Command::Shutdown(func) => {
-                        if !func.is_canceled() {
-                            match conn.close() {
-                                Ok(()) => {
-                                    func.respond(Ok(()));
-                                    return;
-                                }
-                                Err((c, e)) => {
-                                    conn = c;
-                                    func.respond(Err(e.into()));
-                                }
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                for cmd in conn_rx {
+                    match cmd {
+                        Command::Func(func) => func(&mut conn),
+                        Command::Shutdown => match conn.close() {
+                            Ok(()) => {
+                                finish_close(&admission, Ok(()));
+                                return;
                             }
-                        }
+                            Err((connection, error)) => {
+                                conn = connection;
+                                finish_close(&admission, Err(error));
+                            }
+                        },
                     }
                 }
+            }));
+            let previous = {
+                let mut admission = admission.lock().expect("database admission poisoned");
+                core::mem::replace(&mut *admission, Admission::Closed)
+            };
+            drop(previous);
+            if let Err(panic) = result {
+                std::panic::resume_unwind(panic);
             }
         });
     }
@@ -401,8 +312,11 @@ impl Backend {
         E: Send + 'static,
     {
         let (tx, rx) = oneshot::channel();
-        self.conn_tx
-            .try_send(Command::Func(Box::new(AsyncFunc { tx, func })))?;
+        self.conn_tx.try_send(Command::Func(Box::new(move |conn| {
+            if !tx.is_canceled() {
+                _ = tx.send(func(conn));
+            }
+        })))?;
         Ok(rx)
     }
 
@@ -416,16 +330,16 @@ impl Backend {
         E: Send + 'static,
     {
         let (tx, rx) = bounded(1);
-        self.conn_tx
-            .try_send(Command::Func(Box::new(BlockingFunc { tx, func })))?;
+        self.conn_tx.try_send(Command::Func(Box::new(move |conn| {
+            _ = tx.send(func(conn));
+        })))?;
         Ok(rx)
     }
 
     /// Dispatches SQL without canceling accepted work when its caller stops waiting.
     pub async fn dispatch(&self, request: Request) -> Result<Response, Error> {
         let reply = {
-            let mut admission = self.admission.lock().expect("database admission poisoned");
-            admission.refresh();
+            let admission = self.admission.lock().expect("database admission poisoned");
             if !matches!(*admission, Admission::Open) {
                 return Err(Error::Closed);
             }
@@ -448,45 +362,42 @@ impl Backend {
         }
     }
 
+    fn begin_close(&self, reply: CloseReply) -> Result<(), Error> {
+        let mut admission = self.admission.lock().expect("database admission poisoned");
+        match &mut *admission {
+            Admission::Open => match self.conn_tx.try_send(Command::Shutdown) {
+                Ok(()) => {
+                    *admission = Admission::Closing(vec![reply]);
+                    return Ok(());
+                }
+                Err(TrySendError::Disconnected(_)) => *admission = Admission::Closed,
+                Err(error) => return Err(error.into()),
+            },
+            Admission::Closing(replies) => {
+                replies.push(reply);
+                return Ok(());
+            }
+            Admission::Closed => {}
+        }
+        drop(admission);
+        reply(Ok(()));
+        Ok(())
+    }
+
     /// Drains accepted work and shares close completion across cloned clients.
     pub async fn close(&self) -> Result<(), Error> {
-        let reply = {
-            let mut admission = self.admission.lock().expect("database admission poisoned");
-            admission.refresh();
-            match &mut *admission {
-                Admission::Closed => return Ok(()),
-                Admission::Closing(reply) => reply.clone(),
-                Admission::Open => {
-                    let (complete, reply) = oneshot::channel();
-                    let enqueued =
-                        self.conn_tx
-                            .try_send(Command::Shutdown(Box::new(move |result| {
-                                let _ = complete.send(result);
-                            })));
-                    match enqueued {
-                        Ok(()) => {}
-                        Err(TrySendError::Disconnected(_)) => {
-                            *admission = Admission::Closed;
-                            return Ok(());
-                        }
-                        Err(error) => return Err(error.into()),
-                    }
-                    let reply = async move {
-                        reply
-                            .await
-                            .map_err(|error| error.to_string())?
-                            .map_err(|error| error.to_string())
-                    }
-                    .boxed()
-                    .shared();
-                    *admission = Admission::Closing(reply.clone());
-                    reply
-                }
-            }
-        };
+        let (complete, reply) = oneshot::channel();
+        self.begin_close(Box::new(move |result| {
+            _ = complete.send(result);
+        }))?;
         reply
             .await
-            .map_err(|message| Error::OutcomeUnknown { message })
+            .map_err(|error| Error::OutcomeUnknown {
+                message: error.to_string(),
+            })?
+            .map_err(|error| Error::OutcomeUnknown {
+                message: error.to_string(),
+            })
     }
 }
 
@@ -615,22 +526,16 @@ impl Client {
         rx.recv().map_err(Error::from)?
     }
 
-    /// Closes the underlying sqlite connection, blocking the current thread
-    /// until complete.
+    /// Stops SQL admission, drains accepted work and closes the connection,
+    /// blocking until completion.
     ///
-    /// After this method returns, all calls to `self::conn_blocking()` or
-    /// `self::conn_mut_blocking()` will return an [`Error::Closed`] error.
+    /// Concurrent close calls share completion. A failed SQLite close leaves
+    /// the connection available for retry.
     pub fn close_blocking(&self) -> Result<(), Error> {
         let (tx, rx) = bounded(1);
-        match self
-            .backend
-            .conn_tx
-            .try_send(Command::Shutdown(Box::new(BlockingShutdown { tx })))
-        {
-            Ok(()) => {}
-            Err(TrySendError::Disconnected(_)) => return Ok(()),
-            Err(err) => return Err(err.into()),
-        }
+        self.backend.begin_close(Box::new(move |result| {
+            _ = tx.send(result);
+        }))?;
         // If receiving fails, the connection is already closed.
         rx.recv().unwrap_or(Ok(()))
     }
@@ -662,3 +567,6 @@ impl JournalMode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
