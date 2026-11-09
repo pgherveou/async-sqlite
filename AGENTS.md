@@ -34,11 +34,11 @@ The library has three core types in `src/`:
 
 The Client and Pool APIs use closures (e.g., `conn(|conn| { ... })`) to avoid lifetime issues with the cross-thread boundary. Both blocking and async variants exist for these operations.
 
-`src/database.rs` defines the optional typed service; `src/database/native.rs` uses Client threads and `src/worker/` uses browser workers. Admitted service requests survive caller cancellation. Preserve the closure API's separate cancellation behavior; never replay requests after an unknown outcome.
+`src/database.rs` defines the typed service; `src/database/native.rs` uses Client threads and `src/worker/` uses browser workers. Admitted service requests survive caller cancellation. Preserve the closure API's separate cancellation behavior; never replay requests after an unknown outcome.
 
 ## Features
 
-SQLite Cargo features are pass-through to `rusqlite`. The `rusqlite` dependency has `default-features = false`; async-sqlite explicitly defaults to `bundled` plus rusqlite's `cache` and `ffi-sqlite-wasm-rs` defaults. The library re-exports `rusqlite` for downstream use. `service` exposes the typed API and native adapter; `worker` also exposes the browser backend and enables its target-specific transport and SQLite host bindings.
+SQLite Cargo features are pass-through to `rusqlite`. The `rusqlite` dependency has `default-features = false`; async-sqlite explicitly defaults to `bundled` plus rusqlite's `cache` and `ffi-sqlite-wasm-rs` defaults. The library re-exports `rusqlite` for downstream use. `sqlite-wasm-rs` enables the browser backend and its target-specific dependencies.
 
 ## Releases
 
@@ -48,4 +48,4 @@ Version 0.7.0 uses rusqlite 0.41. The library exposes rusqlite types in its publ
 
 Tests in `tests/tests.rs` use a `async_test!` macro that generates two variants of each async test: one running on tokio and one on smol. This ensures runtime compatibility. Tests use `tempfile` for temporary database files.
 
-`tests/database.rs` covers the typed service (`cargo test --features service`). The standalone worker example linked from README owns browser integration tests.
+`tests/database.rs` covers the typed service. The standalone worker example linked from README owns browser integration tests.

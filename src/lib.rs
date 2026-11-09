@@ -84,21 +84,27 @@
 pub use rusqlite;
 
 mod client;
+mod database;
 mod error;
 mod pool;
 
+#[cfg(all(
+    feature = "sqlite-wasm-rs",
+    target_arch = "wasm32",
+    target_os = "unknown"
+))]
+mod worker;
+
 pub use client::{Client, ClientBuilder, JournalMode};
+#[cfg(not(target_arch = "wasm32"))]
+pub use database::NativeDatabase;
+pub use database::{CallError, DatabaseBackend};
 pub use error::Error;
 pub use pool::{Pool, PoolBuilder};
 
-#[cfg(feature = "service")]
-mod database;
-#[cfg(all(feature = "service", not(target_arch = "wasm32")))]
-pub use database::NativeDatabase;
-#[cfg(feature = "service")]
-pub use database::{CallError, DatabaseBackend};
-
-#[cfg(all(feature = "worker", target_arch = "wasm32", target_os = "unknown"))]
-mod worker;
-#[cfg(all(feature = "worker", target_arch = "wasm32", target_os = "unknown"))]
+#[cfg(all(
+    feature = "sqlite-wasm-rs",
+    target_arch = "wasm32",
+    target_os = "unknown"
+))]
 pub use worker::{report_startup_error, serve, serve_with_shutdown, WorkerDatabase};

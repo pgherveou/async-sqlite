@@ -90,8 +90,8 @@ async-sqlite = { version = "*", default-features = false }
 
 ## Typed database services
 
-Enable `service` for the typed `DatabaseBackend` API. `NativeDatabase` dispatches
-requests to a `Client` connection thread. The `worker` feature adds
+`DatabaseBackend` provides a typed API. `NativeDatabase` dispatches requests to a
+`Client` connection thread. The `sqlite-wasm-rs` feature adds
 `WorkerDatabase` for `wasm32-unknown-unknown`, running the same Rust handler in a
 dedicated browser worker with serde/postcard messages.
 
@@ -112,4 +112,4 @@ requests are never automatically retried. `close()` drains accepted work.
 
 See the [worker example](https://github.com/pgherveou/async-sqlite-worker-example)
 for a shared native/browser handler and OPFS tests. Run
-`cargo test --features service` for the library's service tests.
+`cargo test` for the library's tests.

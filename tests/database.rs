@@ -1,4 +1,4 @@
-#![cfg(all(feature = "service", not(target_arch = "wasm32")))]
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::sync::mpsc;
 use std::thread::{self, ThreadId};

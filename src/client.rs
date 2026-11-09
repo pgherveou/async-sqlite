@@ -126,7 +126,7 @@ trait QueuedFunc: Send {
     fn execute(self: Box<Self>, conn: &mut Connection);
 }
 
-#[cfg(all(feature = "service", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 impl<F> QueuedFunc for F
 where
     F: FnOnce(&mut Connection) + Send,
@@ -187,7 +187,7 @@ trait QueuedShutdown: Send {
     fn respond(self: Box<Self>, res: Result<(), Error>);
 }
 
-#[cfg(all(feature = "service", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 impl<F> QueuedShutdown for F
 where
     F: FnOnce(Result<(), Error>) + Send,
@@ -204,7 +204,7 @@ where
 /// Enqueues an operation whose ownership survives its caller's cancellation.
 ///
 /// Failed admission returns an error without running the operation.
-#[cfg(all(feature = "service", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn dispatch_owned<F, T>(
     client: &Client,
     operation: F,
@@ -225,7 +225,7 @@ where
 /// Enqueues shutdown whose completion survives its caller's cancellation.
 ///
 /// Accepted shutdown runs after preceding operations in the same queue.
-#[cfg(all(feature = "service", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn close_owned(
     client: &Client,
     complete: impl FnOnce(Result<(), Error>) + Send + 'static,
