@@ -48,4 +48,4 @@ Version 0.7.0 uses rusqlite 0.41. The library exposes rusqlite types in its publ
 
 Tests in `tests/tests.rs` use a `async_test!` macro that generates two variants of each async test: one running on tokio and one on smol. This ensures runtime compatibility. Tests use `tempfile` for temporary database files.
 
-`tests/database.rs` covers the typed service. `examples/worker-ledger` shares a handler between native tests and `scripts/test-worker.cjs`. Keep fault injection in the example; see [README](README.md#typed-database-services) for test commands.
+`tests/database.rs` covers the typed service (`cargo test --features service`). The standalone worker example linked from README owns browser integration tests.

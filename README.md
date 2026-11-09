@@ -110,18 +110,6 @@ Handlers own transaction boundaries. Dropping a waiting future does not cancel
 an admitted request. `CallError::OutcomeUnknown` can follow a committed write;
 requests are never automatically retried. `close()` drains accepted work.
 
-The [ledger example](examples/worker-ledger) shares a handler between native and
-browser tests. Its database worker initializes OPFS and the schema before serving
-requests, then releases OPFS locks before acknowledging close.
-
-Run the service and example tests with:
-
-```sh
-cargo test --features service
-cargo test --manifest-path examples/worker-ledger/Cargo.toml
-node scripts/test-worker.cjs
-```
-
-The browser test requires the Rust WASM target, wasm-bindgen CLI 0.2.129, and
-Playwright with Chromium. Set `WASM_BINDGEN` or `CHROMIUM` to use custom executables
-and `NODE_PATH` if Playwright is installed outside the project.
+See the [worker example](https://github.com/pgherveou/async-sqlite-worker-example)
+for a shared native/browser handler and OPFS tests. Run
+`cargo test --features service` for the library's service tests.

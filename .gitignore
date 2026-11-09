@@ -6,7 +6,3 @@
 
 /test-async-macro/target
 /test-async-macro/Cargo.lock
-
-/examples/worker-ledger/target
-/examples/worker-ledger/Cargo.lock
-/examples/worker-ledger/web/pkg
