@@ -13,6 +13,8 @@ categories = ["database"]
 
 [features]
 default = ["bundled", "cache", "ffi-sqlite-wasm-rs"]
+service = []
+worker = ["service", "ffi-sqlite-wasm-rs", "dep:serde", "dep:postcard", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys", "dep:web-sys", "dep:sqlite-wasm-rs"]
 array = ["rusqlite/array"]
 backup = ["rusqlite/backup"]
 blob = ["rusqlite/blob"]
@@ -57,6 +59,15 @@ crossbeam-channel = { version = "0.5" }
 futures-channel = { version = "0.3" }
 futures-util = { version = "0.3" }
 rusqlite = { version = "0.41.0", default-features = false }
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
+postcard = { version = "1", features = ["alloc"], optional = true }
+wasm-bindgen = { version = "0.2.129", optional = true }
+wasm-bindgen-futures = { version = "0.4.79", optional = true }
+js-sys = { version = "0.3.106", optional = true }
+web-sys = { version = "0.3.106", features = ["Worker", "WorkerGlobalScope", "DedicatedWorkerGlobalScope", "MessageEvent", "ErrorEvent", "Event", "EventTarget"], optional = true }
+sqlite-wasm-rs = { version = "0.6.2", features = ["wasm-bindgen"], optional = true }
 
 [dev-dependencies]
 paste = { version = "1.0.12" }

@@ -32,11 +32,24 @@ The library has three core types in `src/`:
 
 - **Error** (`error.rs`): Non-exhaustive enum wrapping config errors, queue-full errors, `rusqlite::Error`, channel errors, panics, and pragma failures.
 
-All database operations use a closure-based API (e.g., `conn(|conn| { ... })`) to avoid lifetime issues with the cross-thread boundary. Both blocking and async variants exist for all operations.
+The Client and Pool APIs use closures (e.g., `conn(|conn| { ... })`) to avoid lifetime issues with the cross-thread boundary. Both blocking and async variants exist for these operations.
+
+The optional typed service has a separate ownership contract: once a request is
+admitted, dropping its caller does not cancel it. `src/database.rs` defines
+`DatabaseBackend` and `CallError`; `src/database/native.rs` dispatches owned work
+through the existing `Client`. Keep the closure API's cancellation semantics
+unchanged. Native close and request admission must be serialized across clones.
+
+`src/worker/` implements the browser caller bridge, worker endpoint and postcard
+wire envelopes. The `WorkerDatabase` handle owns channels and admission state;
+JavaScript objects remain on their owning event loop. The database worker runs
+the application's compiled Rust handler and owns its connection. A lost reply
+can follow a committed transaction, so report an unknown outcome and never
+automatically replay requests.
 
 ## Features
 
-All Cargo features are pass-through to `rusqlite`. The `rusqlite` dependency has `default-features = false`; async-sqlite explicitly defaults to `bundled` plus rusqlite's `cache` and `ffi-sqlite-wasm-rs` defaults. The library re-exports `rusqlite` for downstream use.
+SQLite Cargo features are pass-through to `rusqlite`. The `rusqlite` dependency has `default-features = false`; async-sqlite explicitly defaults to `bundled` plus rusqlite's `cache` and `ffi-sqlite-wasm-rs` defaults. The library re-exports `rusqlite` for downstream use. `service` exposes the typed API and native adapter; `worker` also exposes the browser backend and enables its target-specific transport and SQLite host bindings.
 
 ## Releases
 
@@ -45,3 +58,10 @@ Version 0.7.0 uses rusqlite 0.41. The library exposes rusqlite types in its publ
 ## Testing
 
 Tests in `tests/tests.rs` use a `async_test!` macro that generates two variants of each async test: one running on tokio and one on smol. This ensures runtime compatibility. Tests use `tempfile` for temporary database files.
+
+`tests/database.rs` verifies service dispatch, transaction and shutdown contracts.
+`examples/worker-ledger` shares a Rust handler between native tests and real
+browser workers. `scripts/test-worker.cjs` checks worker isolation, OPFS durability
+and lost replies. Run service tests with `cargo test --features service`; follow
+the [README](README.md#testing-database-services) for browser tooling and commands.
+Keep fault injection in the example harness, never in the transport library.

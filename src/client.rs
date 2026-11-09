@@ -126,6 +126,20 @@ trait QueuedFunc: Send {
     fn execute(self: Box<Self>, conn: &mut Connection);
 }
 
+#[cfg(all(feature = "service", not(target_arch = "wasm32")))]
+impl<F> QueuedFunc for F
+where
+    F: FnOnce(&mut Connection) + Send,
+{
+    fn is_canceled(&self) -> bool {
+        false
+    }
+
+    fn execute(self: Box<Self>, conn: &mut Connection) {
+        self(conn);
+    }
+}
+
 struct AsyncFunc<F, T, E> {
     tx: oneshot::Sender<Result<T, E>>,
     func: F,
@@ -171,6 +185,55 @@ where
 trait QueuedShutdown: Send {
     fn is_canceled(&self) -> bool;
     fn respond(self: Box<Self>, res: Result<(), Error>);
+}
+
+#[cfg(all(feature = "service", not(target_arch = "wasm32")))]
+impl<F> QueuedShutdown for F
+where
+    F: FnOnce(Result<(), Error>) + Send,
+{
+    fn is_canceled(&self) -> bool {
+        false
+    }
+
+    fn respond(self: Box<Self>, result: Result<(), Error>) {
+        self(result);
+    }
+}
+
+/// Enqueues an operation whose ownership survives its caller's cancellation.
+///
+/// Failed admission returns an error without running the operation.
+#[cfg(all(feature = "service", not(target_arch = "wasm32")))]
+pub fn dispatch_owned<F, T>(
+    client: &Client,
+    operation: F,
+) -> Result<oneshot::Receiver<Result<T, Error>>, Error>
+where
+    F: FnOnce(&mut Connection) -> Result<T, rusqlite::Error> + Send + 'static,
+    T: Send + 'static,
+{
+    let (reply, result) = oneshot::channel();
+    client.conn_tx.try_send(Command::Func(Box::new(
+        move |connection: &mut Connection| {
+            let _ = reply.send(run_catching(connection, operation));
+        },
+    )))?;
+    Ok(result)
+}
+
+/// Enqueues shutdown whose completion survives its caller's cancellation.
+///
+/// Accepted shutdown runs after preceding operations in the same queue.
+#[cfg(all(feature = "service", not(target_arch = "wasm32")))]
+pub fn close_owned(
+    client: &Client,
+    complete: impl FnOnce(Result<(), Error>) + Send + 'static,
+) -> Result<(), Error> {
+    client
+        .conn_tx
+        .try_send(Command::Shutdown(Box::new(complete)))?;
+    Ok(())
 }
 
 struct AsyncShutdown {
