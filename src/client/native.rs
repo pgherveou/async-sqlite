@@ -10,7 +10,7 @@ use super::{
 };
 use crate::Error;
 
-use crossbeam_channel::{bounded, unbounded, Receiver, Sender, TrySendError};
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use futures_channel::oneshot;
 use rusqlite::{Connection, OpenFlags};
 
@@ -83,7 +83,8 @@ impl ClientBuilder {
     /// By default, the queue is unbounded. If a capacity is configured, calls
     /// return [`Error::QueueFull`] when that many commands are already waiting
     /// for the worker thread. A capacity of `0` allows a command to be accepted
-    /// only when the worker is ready to receive it immediately.
+    /// only when the worker is idle and no command is waiting. Transaction
+    /// rollback on drop bypasses this bound so cleanup always reaches the worker.
     pub fn queue_capacity(mut self, queue_capacity: usize) -> Self {
         self.queue_capacity = Some(queue_capacity);
         self
@@ -101,85 +102,42 @@ impl ClientBuilder {
     /// # }
     /// ```
     pub async fn open(self) -> Result<Client, Error> {
-        Backend::open_async(self).await
+        self.open_with(|_| Ok(())).await
     }
 
-    /// Returns a new [`Client`] that uses the `ClientBuilder` configuration,
-    /// blocking the current thread.
+    /// Initializes the connection on its worker thread before returning the client.
     ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use async_sqlite::ClientBuilder;
-    /// # fn run() -> Result<(), async_sqlite::Error> {
-    /// let client = ClientBuilder::new().open_blocking()?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn open_blocking(self) -> Result<Client, Error> {
-        Backend::open_blocking(self)
+    /// The initializer must leave no transaction open. Its errors and panics fail
+    /// opening the client; accepted SQL uses the shared asynchronous methods.
+    pub async fn open_with<F>(self, initialize: F) -> Result<Client, Error>
+    where
+        F: FnOnce(&mut Connection) -> Result<(), Error> + Send + 'static,
+    {
+        Backend::open(self, initialize).await
     }
 }
 
 enum Command {
-    Func(Box<dyn FnOnce(&mut Connection) + Send>),
+    Sql {
+        request: Request,
+        reply: Option<oneshot::Sender<Result<Response, Error>>>,
+    },
     Shutdown,
 }
 
-fn run_catching<F, T>(conn: &mut Connection, func: F) -> Result<T, Error>
-where
-    F: FnOnce(&mut Connection) -> Result<T, rusqlite::Error>,
-{
-    run_catching_and_then(conn, |conn| func(conn).map_err(Error::from))
-}
-
-fn run_catching_and_then<F, T, E>(conn: &mut Connection, func: F) -> Result<T, E>
-where
-    F: FnOnce(&mut Connection) -> Result<T, E>,
-    E: From<Error>,
-{
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| func(conn))) {
-        Ok(res) => res,
-        Err(p) => {
-            rollback_if_needed(conn);
-            Err(E::from(Error::Panic {
-                message: panic_message(&*p),
-            }))
-        }
-    }
-}
-
-fn rollback_if_needed(conn: &mut Connection) {
-    if !conn.is_autocommit() {
-        let _ = conn.execute_batch("ROLLBACK");
-    }
-}
-
-fn panic_message(p: &(dyn std::any::Any + Send)) -> String {
-    if let Some(s) = p.downcast_ref::<&'static str>() {
-        (*s).to_owned()
-    } else if let Some(s) = p.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "panic".to_owned()
-    }
-}
-
-type CloseReply = Box<dyn FnOnce(Result<(), Error>) + Send>;
-
 enum Admission {
-    Open,
-    Closing(Vec<CloseReply>),
+    Open { worker_idle: bool },
+    Closing(Vec<oneshot::Sender<Result<(), String>>>),
     Closed,
 }
 
-fn finish_close(admission: &Mutex<Admission>, result: rusqlite::Result<()>) {
+fn finish_close(admission: &Mutex<Admission>, result: Result<(), String>) {
     let replies = {
         let mut admission = admission.lock().expect("database admission poisoned");
         let next = if result.is_ok() {
             Admission::Closed
         } else {
-            Admission::Open
+            Admission::Open { worker_idle: false }
         };
         match core::mem::replace(&mut *admission, next) {
             Admission::Closing(replies) => replies,
@@ -187,15 +145,17 @@ fn finish_close(admission: &Mutex<Admission>, result: rusqlite::Result<()>) {
         }
     };
     for reply in replies {
-        reply(match &result {
-            Ok(()) => Ok(()),
-            Err(rusqlite::Error::SqliteFailure(error, message)) => {
-                Err(rusqlite::Error::SqliteFailure(*error, message.clone()).into())
-            }
-            Err(error) => Err(Error::OutcomeUnknown {
-                message: error.to_string(),
-            }),
-        });
+        _ = reply.send(result.clone());
+    }
+}
+
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = panic.downcast_ref::<&'static str>() {
+        (*message).to_owned()
+    } else if let Some(message) = panic.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "database initialization panicked".to_owned()
     }
 }
 
@@ -204,78 +164,101 @@ fn finish_close(admission: &Mutex<Admission>, result: rusqlite::Result<()>) {
 pub struct Backend {
     conn_tx: Sender<Command>,
     admission: Arc<Mutex<Admission>>,
+    queue_capacity: Option<usize>,
 }
 
 impl Backend {
-    async fn open_async(builder: ClientBuilder) -> Result<Client, Error> {
-        let (open_tx, open_rx) = oneshot::channel();
-        Self::open(builder, |res| {
-            _ = open_tx.send(res);
-        });
-        open_rx.await?
-    }
-
-    fn open_blocking(builder: ClientBuilder) -> Result<Client, Error> {
-        let (conn_tx, conn_rx) = bounded(1);
-        Self::open(builder, move |res| {
-            _ = conn_tx.send(res);
-        });
-        conn_rx.recv()?
-    }
-
-    fn open<F>(builder: ClientBuilder, func: F)
+    async fn open<F>(builder: ClientBuilder, initialize: F) -> Result<Client, Error>
     where
-        F: FnOnce(Result<Client, Error>) + Send + 'static,
+        F: FnOnce(&mut Connection) -> Result<(), Error> + Send + 'static,
     {
+        let (ready, result) = oneshot::channel();
         thread::spawn(move || {
-            let (conn_tx, conn_rx) = match builder.queue_capacity {
-                Some(queue_capacity) => bounded(queue_capacity),
-                None => unbounded(),
-            };
-
-            let mut conn = match Self::create_conn(builder) {
-                Ok(conn) => conn,
-                Err(err) => {
-                    func(Err(err));
+            let queue_capacity = builder.queue_capacity;
+            let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut connection = Self::create_conn(builder)?;
+                initialize(&mut connection)?;
+                if !connection.is_autocommit() {
+                    return Err(rusqlite::Error::InvalidQuery.into());
+                }
+                Ok(connection)
+            }))
+            .unwrap_or_else(|panic| {
+                Err(Error::Panic {
+                    message: panic_message(&*panic),
+                })
+            });
+            let connection = match opened {
+                Ok(connection) => connection,
+                Err(error) => {
+                    _ = ready.send(Err(error));
                     return;
                 }
             };
-
-            let admission = Arc::new(Mutex::new(Admission::Open));
-            let client = Client {
-                backend: Self {
-                    conn_tx,
-                    admission: admission.clone(),
-                },
+            let (conn_tx, conn_rx) = unbounded();
+            let admission = Arc::new(Mutex::new(Admission::Open { worker_idle: true }));
+            let backend = Self {
+                conn_tx,
+                admission: admission.clone(),
+                queue_capacity,
             };
-            func(Ok(client));
+            _ = ready.send(Ok(Client::from_backend(backend)));
+            Self::run(connection, conn_rx, &admission);
+        });
+        result.await?
+    }
 
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                for cmd in conn_rx {
-                    match cmd {
-                        Command::Func(func) => func(&mut conn),
-                        Command::Shutdown => match conn.close() {
-                            Ok(()) => {
-                                finish_close(&admission, Ok(()));
-                                return;
+    fn run(mut connection: Connection, commands: Receiver<Command>, admission: &Mutex<Admission>) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || loop {
+            {
+                let mut admission = admission.lock().expect("database admission poisoned");
+                if let Admission::Open { worker_idle } = &mut *admission {
+                    *worker_idle = commands.is_empty();
+                }
+            }
+            let Ok(command) = commands.recv() else {
+                return;
+            };
+            match command {
+                Command::Sql { request, reply } => {
+                    let requires_autocommit = matches!(
+                        &request,
+                        Request::Rollback
+                            | Request::Sql {
+                                in_transaction: false,
+                                ..
                             }
-                            Err((connection, error)) => {
-                                conn = connection;
-                                finish_close(&admission, Err(error));
-                            }
-                        },
+                    );
+                    let result = sql::handle(&mut connection, request).map_err(Error::from);
+                    let close = (requires_autocommit && !connection.is_autocommit())
+                        || (reply.is_none() && result.is_err());
+                    if let Some(reply) = reply {
+                        _ = reply.send(result);
+                    }
+                    if close {
+                        return;
                     }
                 }
-            }));
-            let previous = {
-                let mut admission = admission.lock().expect("database admission poisoned");
-                core::mem::replace(&mut *admission, Admission::Closed)
-            };
-            drop(previous);
-            if let Err(panic) = result {
-                std::panic::resume_unwind(panic);
+                Command::Shutdown => match connection.close() {
+                    Ok(()) => {
+                        finish_close(admission, Ok(()));
+                        return;
+                    }
+                    Err((retained, error)) => {
+                        connection = retained;
+                        finish_close(admission, Err(error.to_string()));
+                    }
+                },
             }
-        });
+        }));
+        let previous = {
+            let mut admission = admission.lock().expect("database admission poisoned");
+            core::mem::replace(&mut *admission, Admission::Closed)
+        };
+        drop(previous);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     fn create_conn(mut builder: ClientBuilder) -> Result<Connection, Error> {
@@ -285,7 +268,6 @@ impl Backend {
         } else {
             Connection::open_with_flags(path, builder.flags)?
         };
-
         if let Some(journal_mode) = builder.journal_mode.take() {
             let val = journal_mode.as_str();
             let out: String =
@@ -298,246 +280,92 @@ impl Backend {
                 });
             }
         }
-
         Ok(conn)
     }
 
-    fn enqueue_async<F, T, E>(
-        &self,
-        func: F,
-    ) -> Result<oneshot::Receiver<Result<T, E>>, TrySendError<Command>>
-    where
-        F: FnOnce(&mut Connection) -> Result<T, E> + Send + 'static,
-        T: Send + 'static,
-        E: Send + 'static,
-    {
-        let (tx, rx) = oneshot::channel();
-        self.conn_tx.try_send(Command::Func(Box::new(move |conn| {
-            if !tx.is_canceled() {
-                _ = tx.send(func(conn));
-            }
-        })))?;
-        Ok(rx)
-    }
-
-    fn enqueue_blocking<F, T, E>(
-        &self,
-        func: F,
-    ) -> Result<Receiver<Result<T, E>>, TrySendError<Command>>
-    where
-        F: FnOnce(&mut Connection) -> Result<T, E> + Send + 'static,
-        T: Send + 'static,
-        E: Send + 'static,
-    {
-        let (tx, rx) = bounded(1);
-        self.conn_tx.try_send(Command::Func(Box::new(move |conn| {
-            _ = tx.send(func(conn));
-        })))?;
-        Ok(rx)
-    }
-
-    /// Dispatches SQL without canceling accepted work when its caller stops waiting.
-    pub async fn dispatch(&self, request: Request) -> Result<Response, Error> {
-        let reply = {
-            let admission = self.admission.lock().expect("database admission poisoned");
-            if !matches!(*admission, Admission::Open) {
-                return Err(Error::Closed);
-            }
-            let (reply, result) = oneshot::channel();
-            self.conn_tx.try_send(Command::Func(Box::new(
-                move |connection: &mut Connection| {
-                    let _ = reply.send(run_catching(connection, |connection| {
-                        sql::handle(connection, request)
-                    }));
-                },
-            )))?;
-            result
-        };
-        match reply.await {
-            Ok(Err(Error::Panic { message })) => Err(Error::OutcomeUnknown { message }),
-            Ok(result) => result,
-            Err(error) => Err(Error::OutcomeUnknown {
-                message: error.to_string(),
-            }),
+    fn queue_full(&self, worker_idle: bool) -> bool {
+        match self.queue_capacity {
+            Some(0) => !worker_idle || !self.conn_tx.is_empty(),
+            Some(capacity) => self.conn_tx.len() >= capacity,
+            None => false,
         }
     }
 
-    fn begin_close(&self, reply: CloseReply) -> Result<(), Error> {
+    /// Admits SQL synchronously; dropping the receiver does not cancel execution.
+    pub fn submit(
+        &self,
+        request: Request,
+    ) -> Result<oneshot::Receiver<Result<Response, Error>>, Error> {
         let mut admission = self.admission.lock().expect("database admission poisoned");
-        match &mut *admission {
-            Admission::Open => match self.conn_tx.try_send(Command::Shutdown) {
-                Ok(()) => {
-                    *admission = Admission::Closing(vec![reply]);
-                    return Ok(());
-                }
-                Err(TrySendError::Disconnected(_)) => *admission = Admission::Closed,
-                Err(error) => return Err(error.into()),
-            },
-            Admission::Closing(replies) => {
-                replies.push(reply);
-                return Ok(());
-            }
-            Admission::Closed => {}
+        let Admission::Open { worker_idle } = &mut *admission else {
+            return Err(Error::Closed);
+        };
+        if self.queue_full(*worker_idle) {
+            return Err(Error::QueueFull);
         }
-        drop(admission);
-        reply(Ok(()));
-        Ok(())
+        *worker_idle = false;
+        let (reply, result) = oneshot::channel();
+        if self
+            .conn_tx
+            .send(Command::Sql {
+                request,
+                reply: Some(reply),
+            })
+            .is_err()
+        {
+            *admission = Admission::Closed;
+            return Err(Error::Closed);
+        }
+        Ok(result)
+    }
+
+    /// Queues transaction cleanup in order even when the ordinary queue is full.
+    ///
+    /// Cleanup failure closes the connection before later requests can execute.
+    pub fn submit_cleanup(&self, request: Request) {
+        let mut admission = self.admission.lock().expect("database admission poisoned");
+        if let Admission::Open { worker_idle } = &mut *admission {
+            *worker_idle = false;
+            if self
+                .conn_tx
+                .send(Command::Sql {
+                    request,
+                    reply: None,
+                })
+                .is_err()
+            {
+                *admission = Admission::Closed;
+            }
+        }
     }
 
     /// Drains accepted work and shares close completion across cloned clients.
     pub async fn close(&self) -> Result<(), Error> {
         let (complete, reply) = oneshot::channel();
-        self.begin_close(Box::new(move |result| {
-            _ = complete.send(result);
-        }))?;
+        {
+            let mut admission = self.admission.lock().expect("database admission poisoned");
+            match &mut *admission {
+                Admission::Open { worker_idle } => {
+                    if self.queue_full(*worker_idle) {
+                        return Err(Error::QueueFull);
+                    }
+                    *worker_idle = false;
+                    if self.conn_tx.send(Command::Shutdown).is_err() {
+                        *admission = Admission::Closed;
+                        return Ok(());
+                    }
+                    *admission = Admission::Closing(vec![complete]);
+                }
+                Admission::Closing(replies) => replies.push(complete),
+                Admission::Closed => return Ok(()),
+            }
+        }
         reply
             .await
             .map_err(|error| Error::OutcomeUnknown {
                 message: error.to_string(),
             })?
-            .map_err(|error| Error::OutcomeUnknown {
-                message: error.to_string(),
-            })
-    }
-}
-
-impl Client {
-    /// Invokes the provided function with a [`rusqlite::Connection`].
-    pub async fn conn<F, T>(&self, func: F) -> Result<T, Error>
-    where
-        F: FnOnce(&Connection) -> Result<T, rusqlite::Error> + Send + 'static,
-        T: Send + 'static,
-    {
-        let rx = self
-            .backend
-            .enqueue_async(move |conn| run_catching(conn, |conn| func(conn)))
-            .map_err(Error::from)?;
-        rx.await?
-    }
-
-    /// Invokes the provided function with a mutable [`rusqlite::Connection`].
-    pub async fn conn_mut<F, T>(&self, func: F) -> Result<T, Error>
-    where
-        F: FnOnce(&mut Connection) -> Result<T, rusqlite::Error> + Send + 'static,
-        T: Send + 'static,
-    {
-        let rx = self
-            .backend
-            .enqueue_async(move |conn| run_catching(conn, func))
-            .map_err(Error::from)?;
-        rx.await?
-    }
-
-    /// Invokes the provided function with a [`rusqlite::Connection`].
-    ///
-    /// Maps the result error type to a custom error; designed to be
-    /// used in conjunction with [`query_and_then`](https://docs.rs/rusqlite/latest/rusqlite/struct.CachedStatement.html#method.query_and_then).
-    pub async fn conn_and_then<F, T, E>(&self, func: F) -> Result<T, E>
-    where
-        F: FnOnce(&Connection) -> Result<T, E> + Send + 'static,
-        T: Send + 'static,
-        E: From<rusqlite::Error> + From<Error> + Send + 'static,
-    {
-        let rx = self
-            .backend
-            .enqueue_async(move |conn| run_catching_and_then(conn, |conn| func(conn)))
-            .map_err(Error::from)?;
-        rx.await.map_err(Error::from)?
-    }
-
-    /// Invokes the provided function with a mutable [`rusqlite::Connection`].
-    ///
-    /// Maps the result error type to a custom error; designed to be
-    /// used in conjunction with [`query_and_then`](https://docs.rs/rusqlite/latest/rusqlite/struct.CachedStatement.html#method.query_and_then).
-    pub async fn conn_mut_and_then<F, T, E>(&self, func: F) -> Result<T, E>
-    where
-        F: FnOnce(&mut Connection) -> Result<T, E> + Send + 'static,
-        T: Send + 'static,
-        E: From<rusqlite::Error> + From<Error> + Send + 'static,
-    {
-        let rx = self
-            .backend
-            .enqueue_async(move |conn| run_catching_and_then(conn, func))
-            .map_err(Error::from)?;
-        rx.await.map_err(Error::from)?
-    }
-
-    /// Invokes the provided function with a [`rusqlite::Connection`], blocking
-    /// the current thread until completion.
-    pub fn conn_blocking<F, T>(&self, func: F) -> Result<T, Error>
-    where
-        F: FnOnce(&Connection) -> Result<T, rusqlite::Error> + Send + 'static,
-        T: Send + 'static,
-    {
-        let rx = self
-            .backend
-            .enqueue_blocking(move |conn| run_catching(conn, |conn| func(conn)))
-            .map_err(Error::from)?;
-        rx.recv()?
-    }
-
-    /// Invokes the provided function with a mutable [`rusqlite::Connection`],
-    /// blocking the current thread until completion.
-    pub fn conn_mut_blocking<F, T>(&self, func: F) -> Result<T, Error>
-    where
-        F: FnOnce(&mut Connection) -> Result<T, rusqlite::Error> + Send + 'static,
-        T: Send + 'static,
-    {
-        let rx = self
-            .backend
-            .enqueue_blocking(move |conn| run_catching(conn, func))
-            .map_err(Error::from)?;
-        rx.recv()?
-    }
-
-    /// Invokes the provided function with a [`rusqlite::Connection`],
-    /// blocking the current thread until completion.
-    ///
-    /// Maps the result error type to a custom error; designed to be
-    /// used in conjunction with [`query_and_then`](https://docs.rs/rusqlite/latest/rusqlite/struct.CachedStatement.html#method.query_and_then).
-    pub fn conn_and_then_blocking<F, T, E>(&self, func: F) -> Result<T, E>
-    where
-        F: FnOnce(&Connection) -> Result<T, E> + Send + 'static,
-        T: Send + 'static,
-        E: From<rusqlite::Error> + From<Error> + Send + 'static,
-    {
-        let rx = self
-            .backend
-            .enqueue_blocking(move |conn| run_catching_and_then(conn, |conn| func(conn)))
-            .map_err(Error::from)?;
-        rx.recv().map_err(Error::from)?
-    }
-
-    /// Invokes the provided function with a mutable [`rusqlite::Connection`],
-    /// blocking the current thread until completion.
-    ///
-    /// Maps the result error type to a custom error; designed to be
-    /// used in conjunction with [`query_and_then`](https://docs.rs/rusqlite/latest/rusqlite/struct.CachedStatement.html#method.query_and_then).
-    pub fn conn_mut_and_then_blocking<F, T, E>(&self, func: F) -> Result<T, E>
-    where
-        F: FnOnce(&mut Connection) -> Result<T, E> + Send + 'static,
-        T: Send + 'static,
-        E: From<rusqlite::Error> + From<Error> + Send + 'static,
-    {
-        let rx = self
-            .backend
-            .enqueue_blocking(move |conn| run_catching_and_then(conn, func))
-            .map_err(Error::from)?;
-        rx.recv().map_err(Error::from)?
-    }
-
-    /// Stops SQL admission, drains accepted work and closes the connection,
-    /// blocking until completion.
-    ///
-    /// Concurrent close calls share completion. A failed SQLite close leaves
-    /// the connection available for retry.
-    pub fn close_blocking(&self) -> Result<(), Error> {
-        let (tx, rx) = bounded(1);
-        self.backend.begin_close(Box::new(move |result| {
-            _ = tx.send(result);
-        }))?;
-        // If receiving fails, the connection is already closed.
-        rx.recv().unwrap_or(Ok(()))
+            .map_err(|message| Error::OutcomeUnknown { message })
     }
 }
 

@@ -11,8 +11,27 @@ use rusqlite::{
     ),
     derive(serde::Serialize, serde::Deserialize)
 )]
-/// SQL operations sent to the connection owner.
+/// Connection operations ordered by the caller's transaction reservation.
 pub enum Request {
+    Sql {
+        operation: Operation,
+        in_transaction: bool,
+    },
+    Begin,
+    Commit,
+    Rollback,
+}
+
+#[cfg_attr(
+    all(
+        feature = "sqlite-wasm-rs",
+        target_arch = "wasm32",
+        target_os = "unknown"
+    ),
+    derive(serde::Serialize, serde::Deserialize)
+)]
+/// SQL statements and their owned parameters.
+pub enum Operation {
     Execute {
         sql: String,
         params: Vec<Cell>,
@@ -223,25 +242,66 @@ impl Row<'_> {
     }
 }
 
-/// Executes a complete SQL operation without retaining a transaction between calls.
+/// Executes SQL within its admitted transaction scope.
 pub fn handle(connection: &mut Connection, request: Request) -> rusqlite::Result<Response> {
-    if !connection.is_autocommit() {
-        return Err(Error::InvalidQuery);
+    match request {
+        Request::Sql {
+            operation,
+            in_transaction,
+        } => {
+            let transaction_active = !connection.is_autocommit();
+            if transaction_active != in_transaction {
+                return Err(Error::InvalidQuery);
+            }
+            let result = execute(connection, operation);
+            if in_transaction {
+                if connection.is_autocommit() {
+                    return result.and(Err(Error::InvalidQuery));
+                }
+            } else if !connection.is_autocommit() {
+                connection.execute_batch("ROLLBACK")?;
+                return result.and(Err(Error::InvalidQuery));
+            }
+            result
+        }
+        Request::Begin => {
+            if !connection.is_autocommit() {
+                return Err(Error::InvalidQuery);
+            }
+            connection.execute_batch("BEGIN IMMEDIATE")?;
+            if connection.is_autocommit() {
+                return Err(Error::InvalidQuery);
+            }
+            Ok(Response::Done)
+        }
+        Request::Commit => {
+            if connection.is_autocommit() {
+                return Err(Error::InvalidQuery);
+            }
+            connection.execute_batch("COMMIT")?;
+            if !connection.is_autocommit() {
+                return Err(Error::InvalidQuery);
+            }
+            Ok(Response::Done)
+        }
+        Request::Rollback => {
+            if !connection.is_autocommit() {
+                connection.execute_batch("ROLLBACK")?;
+            }
+            if !connection.is_autocommit() {
+                return Err(Error::InvalidQuery);
+            }
+            Ok(Response::Done)
+        }
     }
-    let result = execute(connection, request);
-    if !connection.is_autocommit() {
-        connection.execute_batch("ROLLBACK")?;
-        return result.and(Err(Error::InvalidQuery));
-    }
-    result
 }
 
-fn execute(connection: &mut Connection, request: Request) -> rusqlite::Result<Response> {
-    match request {
-        Request::Execute { sql, params } => connection
+fn execute(connection: &mut Connection, operation: Operation) -> rusqlite::Result<Response> {
+    match operation {
+        Operation::Execute { sql, params } => connection
             .execute(&sql, rusqlite::params_from_iter(params))
             .map(Response::Changes),
-        Request::Query {
+        Operation::Query {
             sql,
             params,
             first_only,
@@ -265,7 +325,7 @@ fn execute(connection: &mut Connection, request: Request) -> rusqlite::Result<Re
             }
             Ok(Response::Rows { columns, rows })
         }
-        Request::Batch { sql } => {
+        Operation::Batch { sql } => {
             connection.execute_batch(&sql)?;
             Ok(Response::Done)
         }

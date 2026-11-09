@@ -1,10 +1,10 @@
 #![cfg(not(target_arch = "wasm32"))]
 
-use std::{rc::Rc, sync::mpsc, thread};
+use std::{future::Future, rc::Rc, sync::mpsc, thread, time::Duration};
 
 use async_sqlite::{Client, ClientBuilder, Error};
 use futures_util::{future::BoxFuture, FutureExt};
-use rusqlite::params;
+use rusqlite::{functions::FunctionFlags, params};
 
 async fn database(capacity: Option<usize>) -> Client {
     let builder = match capacity {
@@ -23,19 +23,46 @@ fn send_future<T: Send>(future: T) -> T {
     future
 }
 
-fn block(client: &Client) -> (BoxFuture<'_, Result<(), Error>>, mpsc::Sender<()>) {
+struct Gate {
+    started: mpsc::Receiver<()>,
+    release: mpsc::Sender<()>,
+}
+
+async fn gated_database(capacity: Option<usize>) -> (Client, Gate) {
     let (entered, started) = mpsc::channel();
     let (release, wait) = mpsc::channel();
-    let mut running = client
-        .conn(move |_| {
-            entered.send(()).unwrap();
-            wait.recv().unwrap();
+    let builder = match capacity {
+        Some(capacity) => ClientBuilder::new().queue_capacity(capacity),
+        None => ClientBuilder::new(),
+    };
+    let client = builder
+        .open_with(move |connection| {
+            connection.execute_batch("CREATE TABLE ledger (amount INTEGER, payload BLOB)")?;
+            connection.create_scalar_function(
+                "wait_for_release",
+                0,
+                FunctionFlags::SQLITE_UTF8,
+                move |_| {
+                    entered.send(()).unwrap();
+                    wait.recv().unwrap();
+                    Ok(0)
+                },
+            )?;
             Ok(())
         })
-        .boxed();
+        .await
+        .unwrap();
+    (client, Gate { started, release })
+}
+
+fn block<'a>(
+    query: impl Future<Output = Result<i64, Error>> + Send + 'a,
+    gate: &Gate,
+) -> BoxFuture<'a, Result<i64, Error>> {
+    let mut running = query.boxed();
     assert!(running.as_mut().now_or_never().is_none());
-    started.recv().unwrap();
-    (running, release)
+    gate.started.recv_timeout(Duration::from_secs(10)).unwrap();
+    running
 }
 
 #[test]
@@ -43,10 +70,6 @@ fn query_maps_on_caller_without_a_registered_handler() {
     smol::block_on(async {
         let client = database(None).await;
         let caller = thread::current().id();
-        assert_ne!(
-            client.conn(|_| Ok(thread::current().id())).await.unwrap(),
-            caller
-        );
         let expected = String::from("stored value");
         client
             .execute("INSERT INTO ledger VALUES (?, ?)", params![1, expected])
@@ -216,13 +239,16 @@ fn query_and_conversion_errors_leave_connection_usable() {
 #[test]
 fn accepted_sql_survives_cancellation_but_unpolled_sql_does_not_run() {
     smol::block_on(async {
-        let client = database(None).await;
-        let (running, release) = block(&client);
+        let (client, gate) = gated_database(None).await;
+        let running = block(
+            client.query_row("SELECT wait_for_release()", [], |row| row.get::<i64>(0)),
+            &gate,
+        );
         let mut accepted = Box::pin(client.execute("INSERT INTO ledger VALUES (?, X'')", [1]));
         assert!(accepted.as_mut().now_or_never().is_none());
         drop(accepted);
         drop(client.execute("INSERT INTO ledger VALUES (?, X'')", [2]));
-        release.send(()).unwrap();
+        gate.release.send(()).unwrap();
         running.await.unwrap();
         assert_eq!(
             client
@@ -238,9 +264,12 @@ fn accepted_sql_survives_cancellation_but_unpolled_sql_does_not_run() {
 #[test]
 fn close_drains_accepted_sql_and_survives_a_dropped_waiter() {
     smol::block_on(async {
-        let client = database(None).await;
+        let (client, gate) = gated_database(None).await;
         let clone = client.clone();
-        let (running, release) = block(&client);
+        let running = block(
+            client.query_row("SELECT wait_for_release()", [], |row| row.get::<i64>(0)),
+            &gate,
+        );
         let mut accepted = Box::pin(client.execute("INSERT INTO ledger VALUES (?, X'')", [1]));
         assert!(accepted.as_mut().now_or_never().is_none());
         let mut closing = Box::pin(send_future(client.close()));
@@ -252,21 +281,29 @@ fn close_drains_accepted_sql_and_survives_a_dropped_waiter() {
                 .await,
             Err(Error::Closed)
         ));
-        release.send(()).unwrap();
+        gate.release.send(()).unwrap();
         running.await.unwrap();
         assert_eq!(accepted.await.unwrap(), 1);
         let (first, second) = futures_util::join!(client.close(), clone.close());
         first.unwrap();
         second.unwrap();
-        assert!(matches!(client.conn(|_| Ok(())).await, Err(Error::Closed)));
+        assert!(matches!(
+            client
+                .query_row("SELECT 1", [], |row| row.get::<i64>(0))
+                .await,
+            Err(Error::Closed)
+        ));
     });
 }
 
 #[test]
 fn full_queue_rejects_sql_without_latching_close() {
     smol::block_on(async {
-        let client = database(Some(1)).await;
-        let (running, release) = block(&client);
+        let (client, gate) = gated_database(Some(1)).await;
+        let running = block(
+            client.query_row("SELECT wait_for_release()", [], |row| row.get::<i64>(0)),
+            &gate,
+        );
         let mut accepted = Box::pin(client.execute("INSERT INTO ledger VALUES (?, X'')", [1]));
         assert!(accepted.as_mut().now_or_never().is_none());
         assert!(matches!(
@@ -276,7 +313,7 @@ fn full_queue_rejects_sql_without_latching_close() {
             Err(Error::QueueFull)
         ));
         assert!(matches!(client.close().await, Err(Error::QueueFull)));
-        release.send(()).unwrap();
+        gate.release.send(()).unwrap();
         running.await.unwrap();
         accepted.await.unwrap();
         assert_eq!(
@@ -287,5 +324,197 @@ fn full_queue_rejects_sql_without_latching_close() {
             vec![1]
         );
         client.close().await.unwrap();
+    });
+}
+
+#[test]
+fn transaction_keeps_rust_branches_isolated_until_commit() {
+    smol::block_on(async {
+        let client = database(None).await;
+        client
+            .execute("INSERT INTO ledger VALUES (?, X'')", [100])
+            .await
+            .unwrap();
+        let clone = client.clone();
+        let transaction = send_future(client.transaction()).await.unwrap();
+        let balance = send_future(
+            transaction.query_row("SELECT amount FROM ledger", [], |row| row.get::<i64>(0)),
+        )
+        .await
+        .unwrap();
+        if balance >= 25 {
+            send_future(transaction.execute("UPDATE ledger SET amount=?", [balance - 25]))
+                .await
+                .unwrap();
+        }
+        let mut outside =
+            Box::pin(clone.query_row("SELECT amount FROM ledger", [], |row| row.get::<i64>(0)));
+        assert!(outside.as_mut().now_or_never().is_none());
+        assert_eq!(
+            send_future(
+                transaction.query_map("SELECT amount FROM ledger", [], |row| { row.get::<i64>(0) })
+            )
+            .await
+            .unwrap(),
+            vec![75]
+        );
+        send_future(transaction.commit()).await.unwrap();
+        assert_eq!(outside.await.unwrap(), 75);
+        client.close().await.unwrap();
+    });
+}
+
+#[test]
+fn rollback_and_drop_undo_uncommitted_changes() {
+    smol::block_on(async {
+        let client = database(None).await;
+        for explicit in [true, false] {
+            let transaction = client.transaction().await.unwrap();
+            send_future(transaction.execute_batch("INSERT INTO ledger VALUES (1, X'')"))
+                .await
+                .unwrap();
+            if explicit {
+                send_future(transaction.rollback()).await.unwrap();
+            } else {
+                drop(transaction);
+            }
+            assert_eq!(
+                client
+                    .query_map("SELECT amount FROM ledger", [], |row| row.get::<i64>(0))
+                    .await
+                    .unwrap(),
+                Vec::<i64>::new()
+            );
+        }
+        client.close().await.unwrap();
+    });
+}
+
+#[test]
+fn dropping_an_unpolled_commit_rolls_back() {
+    smol::block_on(async {
+        let client = database(None).await;
+        let transaction = client.transaction().await.unwrap();
+        transaction
+            .execute("INSERT INTO ledger VALUES (1, X'')", [])
+            .await
+            .unwrap();
+        drop(transaction.commit());
+        assert_eq!(
+            client
+                .query_map("SELECT amount FROM ledger", [], |row| row.get::<i64>(0))
+                .await
+                .unwrap(),
+            Vec::<i64>::new()
+        );
+        client.close().await.unwrap();
+    });
+}
+
+#[test]
+fn canceled_transaction_waiter_does_not_reserve_the_connection() {
+    smol::block_on(async {
+        let client = database(None).await;
+        let transaction = client.transaction().await.unwrap();
+        let mut waiting = Box::pin(client.transaction());
+        assert!(waiting.as_mut().now_or_never().is_none());
+        drop(waiting);
+        transaction.commit().await.unwrap();
+        let next = client.transaction().await.unwrap();
+        next.execute("INSERT INTO ledger VALUES (1, X'')", [])
+            .await
+            .unwrap();
+        next.commit().await.unwrap();
+        assert_eq!(
+            client
+                .query_map("SELECT amount FROM ledger", [], |row| row.get::<i64>(0))
+                .await
+                .unwrap(),
+            vec![1]
+        );
+        client.close().await.unwrap();
+    });
+}
+
+#[test]
+fn canceled_admitted_begin_rolls_back_before_releasing_the_connection() {
+    smol::block_on(async {
+        let (client, gate) = gated_database(None).await;
+        let running = block(
+            client.query_row("SELECT wait_for_release()", [], |row| row.get::<i64>(0)),
+            &gate,
+        );
+        let mut beginning = Box::pin(client.transaction());
+        assert!(beginning.as_mut().now_or_never().is_none());
+        drop(beginning);
+        gate.release.send(()).unwrap();
+        running.await.unwrap();
+        client
+            .execute("INSERT INTO ledger VALUES (1, X'')", [])
+            .await
+            .unwrap();
+        let next = client.transaction().await.unwrap();
+        next.rollback().await.unwrap();
+        assert_eq!(
+            client
+                .query_map("SELECT amount FROM ledger", [], |row| row.get::<i64>(0))
+                .await
+                .unwrap(),
+            vec![1]
+        );
+        client.close().await.unwrap();
+    });
+}
+
+#[test]
+fn canceled_admitted_commit_can_persist_and_releases_the_connection() {
+    smol::block_on(async {
+        let (client, gate) = gated_database(None).await;
+        let transaction = client.transaction().await.unwrap();
+        transaction
+            .execute("INSERT INTO ledger VALUES (1, X'')", [])
+            .await
+            .unwrap();
+        let running = block(
+            transaction.query_row("SELECT wait_for_release()", [], |row| row.get::<i64>(0)),
+            &gate,
+        );
+        drop(running);
+        let mut committing = Box::pin(send_future(transaction.commit()));
+        assert!(committing.as_mut().now_or_never().is_none());
+        drop(committing);
+        gate.release.send(()).unwrap();
+        assert_eq!(
+            client
+                .query_map("SELECT amount FROM ledger", [], |row| row.get::<i64>(0))
+                .await
+                .unwrap(),
+            vec![1]
+        );
+        let next = client.transaction().await.unwrap();
+        next.rollback().await.unwrap();
+        client.close().await.unwrap();
+    });
+}
+
+#[test]
+fn close_waits_for_a_transaction_before_stopping_admission() {
+    smol::block_on(async {
+        let client = database(None).await;
+        let transaction = client.transaction().await.unwrap();
+        let mut closing = Box::pin(send_future(client.close()));
+        assert!(closing.as_mut().now_or_never().is_none());
+        transaction
+            .execute("INSERT INTO ledger VALUES (1, X'')", [])
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+        closing.await.unwrap();
+        assert!(matches!(
+            client
+                .query_row("SELECT 1", [], |row| row.get::<i64>(0))
+                .await,
+            Err(Error::Closed)
+        ));
     });
 }

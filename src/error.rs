@@ -22,7 +22,7 @@ pub enum Error {
     },
     /// Represents a [`rusqlite::Error`].
     Rusqlite(rusqlite::Error),
-    /// A user-provided closure panicked while being executed on the worker thread.
+    /// Connection initialization panicked on its worker thread.
     Panic { message: String },
 }
 
@@ -48,7 +48,7 @@ impl std::fmt::Display for Error {
                 write!(f, "updating pragma {name}: expected '{exp}', got '{got}'")
             }
             Error::Rusqlite(err) => err.fmt(f),
-            Error::Panic { message } => write!(f, "user closure panicked: {message}"),
+            Error::Panic { message } => write!(f, "database initialization panicked: {message}"),
         }
     }
 }
@@ -56,27 +56,6 @@ impl std::fmt::Display for Error {
 impl From<rusqlite::Error> for Error {
     fn from(value: rusqlite::Error) -> Self {
         Error::Rusqlite(value)
-    }
-}
-
-impl<T> From<crossbeam_channel::SendError<T>> for Error {
-    fn from(_value: crossbeam_channel::SendError<T>) -> Self {
-        Error::Closed
-    }
-}
-
-impl<T> From<crossbeam_channel::TrySendError<T>> for Error {
-    fn from(value: crossbeam_channel::TrySendError<T>) -> Self {
-        match value {
-            crossbeam_channel::TrySendError::Full(_) => Error::QueueFull,
-            crossbeam_channel::TrySendError::Disconnected(_) => Error::Closed,
-        }
-    }
-}
-
-impl From<crossbeam_channel::RecvError> for Error {
-    fn from(_value: crossbeam_channel::RecvError) -> Self {
-        Error::Closed
     }
 }
 

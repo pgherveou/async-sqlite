@@ -32,7 +32,7 @@
 //! }
 //! ```
 //!
-//! Native `conn` calls canceled before the worker starts them are skipped.
+//! Accepted SQL operations survive caller cancellation.
 //! `ClientBuilder::queue_capacity()` and
 //! `PoolBuilder::queue_capacity()` can be used to bound worker queues;
 //! operations return [`Error::QueueFull`] when the selected queue is full.
@@ -47,7 +47,7 @@
 //! use `shared_memory("name")`; this uses SQLite shared-cache mode, which has
 //! caveats, so prefer a file-backed database when possible.
 //!
-//! To create a sqlite pool and run a query:
+//! To create a sqlite pool and run a query in a transaction:
 //!
 //! ```rust
 //! use async_sqlite::{JournalMode, PoolBuilder};
@@ -59,9 +59,11 @@
 //!               .open()
 //!               .await?;
 //!
-//! let value: String = pool.conn(|conn| {
-//!     conn.query_row("SELECT val FROM testing WHERE id=?", [1], |row| row.get(0))
-//! }).await?;
+//! let transaction = pool.transaction().await?;
+//! let value: String = transaction
+//!     .query_row("SELECT val FROM testing WHERE id=?", [1], |row| row.get(0))
+//!     .await?;
+//! transaction.commit().await?;
 //!
 //! println!("Value is: {value}");
 //! # Ok(())
@@ -87,6 +89,7 @@ pub use rusqlite;
     not(target_arch = "wasm32"),
     all(feature = "sqlite-wasm-rs", target_os = "unknown")
 ))]
+#[macro_use]
 mod client;
 mod error;
 #[cfg(not(target_arch = "wasm32"))]
@@ -102,7 +105,7 @@ pub use client::{report_startup_error, serve, serve_with_shutdown};
     not(target_arch = "wasm32"),
     all(feature = "sqlite-wasm-rs", target_os = "unknown")
 ))]
-pub use client::{Client, Params, Row};
+pub use client::{Client, Params, Row, Transaction};
 #[cfg(not(target_arch = "wasm32"))]
 pub use client::{ClientBuilder, JournalMode};
 pub use error::Error;

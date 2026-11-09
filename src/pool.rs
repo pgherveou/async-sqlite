@@ -8,7 +8,8 @@ use std::{
     thread::available_parallelism,
 };
 
-use crate::{Client, ClientBuilder, Error, JournalMode};
+use crate::{Client, ClientBuilder, Error, JournalMode, Transaction};
+use core::future::Future;
 
 use futures_util::future::join_all;
 use rusqlite::{Connection, OpenFlags};
@@ -126,8 +127,8 @@ impl PoolBuilder {
     /// By default, each queue is unbounded. If a capacity is configured, calls
     /// return [`Error::QueueFull`] when a selected connection already has that
     /// many commands waiting for its worker thread. A capacity of `0` allows a
-    /// command to be accepted only when the worker is ready to receive it
-    /// immediately.
+    /// command to be accepted only when the worker is idle and none is queued.
+    /// Transaction rollback on drop bypasses this bound.
     pub fn queue_capacity(mut self, queue_capacity: usize) -> Self {
         self.queue_capacity = Some(queue_capacity);
         self
@@ -145,58 +146,37 @@ impl PoolBuilder {
     /// # }
     /// ```
     pub async fn open(self) -> Result<Pool, Error> {
+        self.open_with(|_| Ok(())).await
+    }
+
+    /// Opens every connection and initializes it on its worker thread.
+    ///
+    /// The initializer runs once per connection after applying the builder
+    /// configuration. Any initializer error prevents the pool from opening.
+    pub async fn open_with<F>(self, initialize: F) -> Result<Pool, Error>
+    where
+        F: Fn(&mut Connection) -> Result<(), Error> + Send + Sync + 'static,
+    {
         let num_conns = self.get_num_conns();
         self.validate(num_conns)?;
+        let initialize = Arc::new(initialize);
 
-        // Open the first connection with full config (including journal_mode).
-        // This must complete before opening remaining connections to avoid
-        // concurrent PRAGMA writes on a new database file.
-        let first = self.client_builder().open().await?;
-
-        // Open remaining connections with journal_mode too, so connection-local
-        // modes are applied consistently across the pool.
-        let opens = (1..num_conns).map(|_| self.client_builder().open());
+        // Configure the first connection before concurrent PRAGMA writes.
+        let first_initialize = initialize.clone();
+        let first = self
+            .client_builder()
+            .open_with(move |connection| first_initialize(connection))
+            .await?;
+        let opens = (1..num_conns).map(|_| {
+            let initialize = initialize.clone();
+            self.client_builder()
+                .open_with(move |connection| initialize(connection))
+        });
         let mut clients = vec![first];
         clients.extend(
             join_all(opens)
                 .await
                 .into_iter()
-                .collect::<Result<Vec<Client>, Error>>()?,
-        );
-
-        Ok(Pool {
-            state: Arc::new(State {
-                clients,
-                counter: AtomicU64::new(0),
-            }),
-        })
-    }
-
-    /// Returns a new [`Pool`] that uses the `PoolBuilder` configuration,
-    /// blocking the current thread.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use async_sqlite::PoolBuilder;
-    /// # fn run() -> Result<(), async_sqlite::Error> {
-    /// let pool = PoolBuilder::new().open_blocking()?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn open_blocking(self) -> Result<Pool, Error> {
-        let num_conns = self.get_num_conns();
-        self.validate(num_conns)?;
-
-        // Open the first connection with full config (including journal_mode).
-        let first = self.client_builder().open_blocking()?;
-
-        // Open remaining connections with journal_mode too, so connection-local
-        // modes are applied consistently across the pool.
-        let mut clients = vec![first];
-        clients.extend(
-            (1..num_conns)
-                .map(|_| self.client_builder().open_blocking())
                 .collect::<Result<Vec<Client>, Error>>()?,
         );
 
@@ -304,7 +284,7 @@ fn push_uri_encoded(input: &str, out: &mut String) {
 
 /// A simple Pool of sqlite connections.
 ///
-/// A Pool has the same API as an individual [`Client`].
+/// SQL calls select a connection; a transaction reserves it until completion.
 #[derive(Clone)]
 pub struct Pool {
     state: Arc<State>,
@@ -316,54 +296,19 @@ struct State {
 }
 
 impl Pool {
-    /// Invokes the provided function with a [`rusqlite::Connection`].
-    pub async fn conn<F, T>(&self, func: F) -> Result<T, Error>
-    where
-        F: FnOnce(&Connection) -> Result<T, rusqlite::Error> + Send + 'static,
-        T: Send + 'static,
-    {
-        self.get().conn(func).await
-    }
+    sql_methods!();
 
-    /// Invokes the provided function with a mutable [`rusqlite::Connection`].
-    pub async fn conn_mut<F, T>(&self, func: F) -> Result<T, Error>
-    where
-        F: FnOnce(&mut Connection) -> Result<T, rusqlite::Error> + Send + 'static,
-        T: Send + 'static,
-    {
-        self.get().conn_mut(func).await
-    }
-
-    /// Invokes the provided function with a [`rusqlite::Connection`].
+    /// Reserves one connection until the transaction finishes or is dropped.
     ///
-    /// Maps the result error type to a custom error; designed to be
-    /// used in conjunction with [`query_and_then`](https://docs.rs/rusqlite/latest/rusqlite/struct.CachedStatement.html#method.query_and_then).
-    pub async fn conn_and_then<F, T, E>(&self, func: F) -> Result<T, E>
-    where
-        F: FnOnce(&Connection) -> Result<T, E> + Send + 'static,
-        T: Send + 'static,
-        E: From<rusqlite::Error> + From<Error> + Send + 'static,
-    {
-        self.get().conn_and_then(func).await
+    /// Calls selecting that connection wait for the reservation. Other pool
+    /// connections remain available, subject to SQLite's transaction locks.
+    pub async fn transaction(&self) -> Result<Transaction, Error> {
+        self.get().transaction().await
     }
 
-    /// Invokes the provided function with a mutable [`rusqlite::Connection`].
+    /// Closes the underlying sqlite connections after their transactions finish.
     ///
-    /// Maps the result error type to a custom error; designed to be
-    /// used in conjunction with [`query_and_then`](https://docs.rs/rusqlite/latest/rusqlite/struct.CachedStatement.html#method.query_and_then).
-    pub async fn conn_mut_and_then<F, T, E>(&self, func: F) -> Result<T, E>
-    where
-        F: FnOnce(&mut Connection) -> Result<T, E> + Send + 'static,
-        T: Send + 'static,
-        E: From<rusqlite::Error> + From<Error> + Send + 'static,
-    {
-        self.get().conn_mut_and_then(func).await
-    }
-
-    /// Closes the underlying sqlite connections.
-    ///
-    /// After this method returns, all calls to `self::conn()` or
-    /// `self::conn_mut()` will return an [`Error::Closed`] error.
+    /// After successful close, all SQL methods return [`Error::Closed`].
     pub async fn close(&self) -> Result<(), Error> {
         let closes = self.state.clients.iter().map(|client| client.close());
         let res = join_all(closes).await;
@@ -371,108 +316,15 @@ impl Pool {
         Ok(())
     }
 
-    /// Invokes the provided function with a [`rusqlite::Connection`], blocking
-    /// the current thread.
-    pub fn conn_blocking<F, T>(&self, func: F) -> Result<T, Error>
-    where
-        F: FnOnce(&Connection) -> Result<T, rusqlite::Error> + Send + 'static,
-        T: Send + 'static,
-    {
-        self.get().conn_blocking(func)
-    }
-
-    /// Invokes the provided function with a mutable [`rusqlite::Connection`],
-    /// blocking the current thread.
-    pub fn conn_mut_blocking<F, T>(&self, func: F) -> Result<T, Error>
-    where
-        F: FnOnce(&mut Connection) -> Result<T, rusqlite::Error> + Send + 'static,
-        T: Send + 'static,
-    {
-        self.get().conn_mut_blocking(func)
-    }
-
-    /// Invokes the provided function with a [`rusqlite::Connection`], blocking
-    /// the current thread.
-    ///
-    /// Maps the result error type to a custom error; designed to be
-    /// used in conjunction with [`query_and_then`](https://docs.rs/rusqlite/latest/rusqlite/struct.CachedStatement.html#method.query_and_then).
-    pub fn conn_and_then_blocking<F, T, E>(&self, func: F) -> Result<T, E>
-    where
-        F: FnOnce(&Connection) -> Result<T, E> + Send + 'static,
-        T: Send + 'static,
-        E: From<rusqlite::Error> + From<Error> + Send + 'static,
-    {
-        self.get().conn_and_then_blocking(func)
-    }
-
-    /// Invokes the provided function with a mutable [`rusqlite::Connection`],
-    /// blocking the current thread.
-    ///
-    /// Maps the result error type to a custom error; designed to be
-    /// used in conjunction with [`query_and_then`](https://docs.rs/rusqlite/latest/rusqlite/struct.CachedStatement.html#method.query_and_then).
-    pub fn conn_mut_and_then_blocking<F, T, E>(&self, func: F) -> Result<T, E>
-    where
-        F: FnOnce(&mut Connection) -> Result<T, E> + Send + 'static,
-        T: Send + 'static,
-        E: From<rusqlite::Error> + From<Error> + Send + 'static,
-    {
-        self.get().conn_mut_and_then_blocking(func)
-    }
-
-    /// Closes the underlying sqlite connections, blocking the current thread.
-    ///
-    /// After this method returns, all calls to `self::conn_blocking()` or
-    /// `self::conn_mut_blocking()` will return an [`Error::Closed`] error.
-    pub fn close_blocking(&self) -> Result<(), Error> {
-        let mut first_err = None;
-        for client in self.state.clients.iter() {
-            if let Err(e) = client.close_blocking() {
-                if first_err.is_none() {
-                    first_err = Some(e);
-                }
-            }
-        }
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
+    fn dispatch(
+        &self,
+        operation: crate::client::Operation,
+    ) -> impl Future<Output = Result<crate::client::Response, Error>> + Send + '_ {
+        crate::client::dispatch(self.get(), operation)
     }
 
     fn get(&self) -> &Client {
         let n = self.state.counter.fetch_add(1, Relaxed);
         &self.state.clients[n as usize % self.state.clients.len()]
-    }
-
-    /// Runs a function on all connections in the pool asynchronously.
-    ///
-    /// The function is executed on each connection concurrently.
-    pub async fn conn_for_each<F, T>(&self, func: F) -> Vec<Result<T, Error>>
-    where
-        F: Fn(&Connection) -> Result<T, rusqlite::Error> + Send + Sync + 'static,
-        T: Send + 'static,
-    {
-        let func = Arc::new(func);
-        let futures = self.state.clients.iter().map(|client| {
-            let func = func.clone();
-            async move { client.conn(move |conn| func(conn)).await }
-        });
-        join_all(futures).await
-    }
-
-    /// Runs a function on all connections in the pool, blocking the current thread.
-    pub fn conn_for_each_blocking<F, T>(&self, func: F) -> Vec<Result<T, Error>>
-    where
-        F: Fn(&Connection) -> Result<T, rusqlite::Error> + Send + Sync + 'static,
-        T: Send + 'static,
-    {
-        let func = Arc::new(func);
-        self.state
-            .clients
-            .iter()
-            .map(|client| {
-                let func = func.clone();
-                client.conn_blocking(move |conn| func(conn))
-            })
-            .collect()
     }
 }

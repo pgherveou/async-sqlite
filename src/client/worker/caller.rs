@@ -186,14 +186,20 @@ impl Backend {
         }
     }
 
-    /// Dispatches SQL without canceling admitted work when its caller stops waiting.
-    pub async fn dispatch(&self, request: sql::Request) -> Result<sql::Response, Error> {
+    /// Admits an operation without canceling it when its caller stops waiting.
+    pub fn submit(
+        &self,
+        request: sql::Request,
+    ) -> Result<oneshot::Receiver<Result<sql::Response, Error>>, Error> {
         let (reply, result) = oneshot::channel();
         self.admit(request, reply)
             .map_err(|message| Error::NotDispatched { message })?;
-        result.await.map_err(|_| Error::OutcomeUnknown {
-            message: "database worker disconnected".into(),
-        })?
+        Ok(result)
+    }
+
+    /// Queues transaction cleanup before another caller can acquire its reservation.
+    pub fn submit_cleanup(&self, request: sql::Request) {
+        let _ = self.submit(request);
     }
 
     /// Drains accepted work and closes SQLite before terminating its worker.

@@ -42,8 +42,7 @@ let value: String = client
 println!("Value is: {value}");
 ```
 
-Native `conn` calls canceled before the worker starts them are skipped.
-Both close methods reject new SQL before draining accepted work.
+Accepted SQL operations survive caller cancellation.
 `ClientBuilder::queue_capacity()` and
 `PoolBuilder::queue_capacity()` can be used to bound worker queues; operations
 return `Error::QueueFull` when the selected queue is full.
@@ -58,7 +57,7 @@ count. For multiple connections to a named in-memory database, use
 `shared_memory("name")`; this uses SQLite shared-cache mode, which has caveats,
 so prefer a file-backed database when possible.
 
-To create a sqlite pool and run a query:
+To create a sqlite pool and run a query in a transaction:
 
 ```rust
 use async_sqlite::{JournalMode, PoolBuilder};
@@ -69,9 +68,11 @@ let pool = PoolBuilder::new()
               .open()
               .await?;
 
-let value: String = pool.conn(|conn| {
-    conn.query_row("SELECT val FROM testing WHERE id=?", [1], |row| row.get(0))
-}).await?;
+let transaction = pool.transaction().await?;
+let value: String = transaction
+    .query_row("SELECT val FROM testing WHERE id=?", [1], |row| row.get(0))
+    .await?;
+transaction.commit().await?;
 
 println!("Value is: {value}");
 ```
@@ -95,12 +96,14 @@ The `sqlite-wasm-rs` feature enables `Client::connect(worker)` on
 `wasm32-unknown-unknown`. The database worker initializes its VFS and schema, then
 awaits `serve(connection)`. Use `serve_with_shutdown` to release VFS resources on close.
 
-Both backends provide `execute`, `query_row`, `query_map` and `execute_batch`.
-Row mappers run on the caller over buffered results. Native `conn` methods remain
-available for direct rusqlite access, including transactions that branch in Rust.
+`Client` and `Transaction` share `execute`, `query_row`, `query_map` and
+`execute_batch` on both targets; native `Pool` forwards the same methods.
+A transaction reserves one connection across awaits; dropping it
+queues rollback. Finish or drop it before awaiting ordinary client calls or close.
+Native `open_with` initializes connections on their threads before serving SQL.
 
-Accepted SQL operations survive caller cancellation. A lost reply produces
-`Error::OutcomeUnknown`; a write may have committed and is never automatically retried.
+A lost reply produces `Error::OutcomeUnknown`; a write may have committed and is
+never automatically retried.
 
 See the [worker example](https://github.com/pgherveou/async-sqlite-worker-example)
 for shared SQL calls and OPFS tests. Run `cargo test` for the library's tests.

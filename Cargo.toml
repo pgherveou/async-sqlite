@@ -1,6 +1,6 @@
 [package]
 name = "async-sqlite"
-version = "0.7.0"
+version = "0.8.0"
 authors = ["Ryan Fowler"]
 edition = "2021"
 rust-version = "1.95.0"
@@ -69,6 +69,7 @@ web-sys = { version = "0.3.106", features = ["Worker", "WorkerGlobalScope", "Ded
 sqlite-wasm-rs = { version = "0.6.2", features = ["wasm-bindgen"], optional = true }
 
 [dev-dependencies]
+rusqlite = { version = "0.41.0", default-features = false, features = ["functions"] }
 paste = { version = "1.0.12" }
 smol = { version = "2" }
 tempfile = { version = "3.6.0" }

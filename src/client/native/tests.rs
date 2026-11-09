@@ -1,222 +1,287 @@
 use super::*;
-use futures_util::{future::BoxFuture, FutureExt};
+use futures_util::FutureExt;
 use std::{
-    sync::mpsc,
+    task::{Context, Poll, Wake, Waker},
     time::{Duration, Instant},
 };
 
-fn block(client: &Client) -> (BoxFuture<'_, Result<(), Error>>, mpsc::Sender<()>) {
-    let (entered, started) = mpsc::channel();
-    let (release, wait) = mpsc::channel();
-    let mut running = client
-        .conn(move |_| {
-            entered.send(()).unwrap();
-            wait.recv_timeout(Duration::from_secs(5)).unwrap();
-            Ok(())
-        })
-        .boxed();
-    assert!(running.as_mut().now_or_never().is_none());
-    started.recv_timeout(Duration::from_secs(5)).unwrap();
-    (running, release)
+fn backend(capacity: Option<usize>) -> (Backend, Receiver<Command>) {
+    let (conn_tx, commands) = unbounded();
+    (
+        Backend {
+            conn_tx,
+            admission: Arc::new(Mutex::new(Admission::Open { worker_idle: true })),
+            queue_capacity: capacity,
+        },
+        commands,
+    )
 }
 
-fn closing(client: &Client, queued: usize) -> thread::JoinHandle<Result<(), Error>> {
-    let clone = client.clone();
-    let closing = thread::spawn(move || clone.close_blocking());
+fn batch(sql: &str, in_transaction: bool) -> Request {
+    Request::Sql {
+        operation: sql::Operation::Batch { sql: sql.into() },
+        in_transaction,
+    }
+}
+
+fn wait_until_idle(backend: &Backend) {
     let deadline = Instant::now() + Duration::from_secs(5);
-    while client.backend.conn_tx.len() == queued && Instant::now() < deadline {
+    while !matches!(
+        *backend.admission.lock().unwrap(),
+        Admission::Open { worker_idle: true }
+    ) {
+        assert!(Instant::now() < deadline, "worker did not become idle");
         thread::yield_now();
     }
-    assert_eq!(client.backend.conn_tx.len(), queued + 1);
-    closing
 }
 
 #[test]
-fn blocking_close_drains_accepted_sql_and_rejects_later_calls() {
+fn setup_runs_before_the_client_is_ready() {
+    smol::block_on(async {
+        let client = ClientBuilder::new()
+            .open_with(|connection| {
+                connection.execute_batch(
+                    "CREATE TABLE initialized (value); INSERT INTO initialized VALUES (42)",
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let value: i64 = client
+            .query_row("SELECT value FROM initialized", [], |row| row.get(0))
+            .await
+            .unwrap();
+        assert_eq!(value, 42);
+        client.close().await.unwrap();
+    });
+}
+
+#[test]
+fn invalid_setup_never_returns_a_client() {
+    smol::block_on(async {
+        let refused = ClientBuilder::new()
+            .open_with(|_| Err(Error::Config { message: "refused" }))
+            .await;
+        assert!(matches!(refused, Err(Error::Config { message: "refused" })));
+        let panic = ClientBuilder::new()
+            .open_with(|_| panic!("setup panic"))
+            .await;
+        assert!(matches!(panic, Err(Error::Panic { message }) if message == "setup panic"));
+        let transaction = ClientBuilder::new()
+            .open_with(|connection| {
+                connection.execute_batch("BEGIN")?;
+                Ok(())
+            })
+            .await;
+        assert!(matches!(
+            transaction,
+            Err(Error::Rusqlite(rusqlite::Error::InvalidQuery))
+        ));
+    });
+}
+
+#[test]
+fn zero_capacity_accepts_only_one_request_while_idle() {
+    let (backend, commands) = backend(Some(0));
+    let first = backend.submit(batch("SELECT 1", false)).unwrap();
+    assert!(matches!(
+        backend.submit(batch("SELECT 2", false)),
+        Err(Error::QueueFull)
+    ));
+    assert!(matches!(commands.try_recv(), Ok(Command::Sql { .. })));
+    assert!(matches!(
+        backend.submit(batch("SELECT 3", false)),
+        Err(Error::QueueFull)
+    ));
+    *backend.admission.lock().unwrap() = Admission::Open { worker_idle: true };
+    let next = backend.submit(batch("SELECT 4", false)).unwrap();
+    drop((first, next));
+}
+
+#[test]
+fn cleanup_bypasses_full_queues_and_rolls_back_before_later_sql() {
+    for capacity in [0, 1] {
+        smol::block_on(async {
+            let (backend, commands) = backend(Some(capacity));
+            let connection = Connection::open_in_memory().unwrap();
+            connection
+                .execute_batch("CREATE TABLE ledger (value); BEGIN")
+                .unwrap();
+            let accepted = backend
+                .submit(batch("INSERT INTO ledger VALUES (1)", true))
+                .unwrap();
+            assert!(matches!(backend.close().await, Err(Error::QueueFull)));
+            backend.submit_cleanup(Request::Rollback);
+            assert_eq!(backend.conn_tx.len(), 2);
+            assert!(matches!(
+                backend.submit(batch("SELECT 1", false)),
+                Err(Error::QueueFull)
+            ));
+            let admission = backend.admission.clone();
+            let worker = thread::spawn(move || Backend::run(connection, commands, &admission));
+            assert_eq!(accepted.await.unwrap().unwrap(), Response::Done);
+            wait_until_idle(&backend);
+            let result = backend
+                .submit(Request::Sql {
+                    operation: sql::Operation::Query {
+                        sql: "SELECT COUNT(*) FROM ledger".into(),
+                        params: Vec::new(),
+                        first_only: true,
+                    },
+                    in_transaction: false,
+                })
+                .unwrap()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                result,
+                Response::Rows {
+                    columns: vec!["COUNT(*)".into()],
+                    rows: vec![vec![sql::Cell::Integer(0)]],
+                }
+            );
+            wait_until_idle(&backend);
+            backend.close().await.unwrap();
+            worker.join().unwrap();
+        });
+    }
+}
+
+#[test]
+fn failed_cleanup_rejects_later_work_and_settles_close() {
     smol::block_on(async {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("ledger.sqlite");
-        let client = ClientBuilder::new().path(&path).open().await.unwrap();
-        client
-            .execute_batch("CREATE TABLE ledger (value INTEGER)")
-            .await
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch("CREATE TABLE ledger (value)")
             .unwrap();
-        let (running, release) = block(&client);
-        let mut accepted = Box::pin(client.execute("INSERT INTO ledger VALUES (1)", []));
-        assert!(accepted.as_mut().now_or_never().is_none());
-        let closing = closing(&client, 1);
-        let mut request = Box::pin(client.execute("INSERT INTO ledger VALUES (2)", []));
-        let first_poll = request.as_mut().now_or_never();
-        release.send(()).unwrap();
-        running.await.unwrap();
-        closing.join().unwrap().unwrap();
-        let result = match first_poll {
-            Some(result) => result,
-            None => request.await,
-        };
-        assert!(matches!(result, Err(Error::Closed)), "{result:?}");
+        let (backend, commands) = backend(None);
+        backend.submit_cleanup(batch("SELECT missing_function()", false));
+        let pending = backend
+            .submit(batch("INSERT INTO ledger VALUES (1)", false))
+            .unwrap();
+        let mut closing = Box::pin(backend.close());
+        assert!(closing.as_mut().now_or_never().is_none());
+        Backend::run(connection, commands, &backend.admission);
+        assert!(pending.await.is_err());
+        assert!(matches!(closing.await, Err(Error::OutcomeUnknown { .. })));
+        assert!(matches!(
+            backend.submit(batch("SELECT 1", false)),
+            Err(Error::Closed)
+        ));
         let connection = Connection::open(path).unwrap();
-        let rows: Vec<i64> = connection
-            .prepare("SELECT value FROM ledger")
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM ledger", [], |row| row.get(0))
             .unwrap();
-        assert_eq!((accepted.await.unwrap(), rows), (1, vec![1]));
+        assert_eq!(count, 0);
     });
 }
 
+#[cfg(feature = "hooks")]
 #[test]
-fn blocking_and_async_close_share_one_shutdown() {
+fn denied_batch_rollback_closes_before_later_requests() {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+
     smol::block_on(async {
-        let client = ClientBuilder::new().open().await.unwrap();
-        let (running, release) = block(&client);
-        let closing = closing(&client, 0);
-        let mut also_closing = Box::pin(client.close());
-        assert!(also_closing.as_mut().now_or_never().is_none());
-        let queued = client.backend.conn_tx.len();
-        release.send(()).unwrap();
-        running.await.unwrap();
-        closing.join().unwrap().unwrap();
-        let result = also_closing.await;
-        assert_eq!(queued, 1);
-        result.unwrap();
-        client.close_blocking().unwrap();
-    });
-}
-
-#[test]
-fn failed_close_preserves_sqlite_errors_and_allows_retry() {
-    let (conn_tx, commands) = unbounded();
-    let backend = Backend {
-        conn_tx,
-        admission: Arc::new(Mutex::new(Admission::Open)),
-    };
-    let (completed, results) = mpsc::channel();
-    for _ in 0..2 {
-        let completed = completed.clone();
-        let admission = backend.admission.clone();
-        backend
-            .begin_close(Box::new(move |result| {
-                let Err(Error::Rusqlite(rusqlite::Error::SqliteFailure(error, message))) = result
-                else {
-                    panic!("unexpected close result: {result:?}");
-                };
-                let open = matches!(*admission.lock().unwrap(), Admission::Open);
-                completed
-                    .send((error.extended_code, message, open))
-                    .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ledger.sqlite");
+        let mut connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch("CREATE TABLE ledger (value)")
+            .unwrap();
+        connection
+            .authorizer(Some(|context: AuthContext<'_>| match context.action {
+                AuthAction::Transaction {
+                    operation: TransactionOperation::Rollback,
+                } => Authorization::Deny,
+                _ => Authorization::Allow,
             }))
             .unwrap();
-    }
-    assert!(matches!(commands.try_recv(), Ok(Command::Shutdown)));
-    assert!(commands.is_empty());
-    finish_close(
-        &backend.admission,
-        Err(rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
-            Some("unfinished statement".into()),
-        )),
-    );
-    assert_eq!(
-        results.try_iter().collect::<Vec<_>>(),
-        vec![
-            (
-                rusqlite::ffi::SQLITE_BUSY,
-                Some("unfinished statement".into()),
-                true,
-            );
-            2
-        ]
-    );
-
-    let (completed, result) = mpsc::channel();
-    backend
-        .begin_close(Box::new(move |result| completed.send(result).unwrap()))
-        .unwrap();
-    assert!(matches!(commands.try_recv(), Ok(Command::Shutdown)));
-    finish_close(&backend.admission, Ok(()));
-    result.recv().unwrap().unwrap();
-    assert!(matches!(
-        *backend.admission.lock().unwrap(),
-        Admission::Closed
-    ));
+        let (backend, commands) = backend(None);
+        let failing = backend
+            .submit(batch("BEGIN; INSERT INTO ledger VALUES (1)", false))
+            .unwrap();
+        let pending = backend
+            .submit(batch("SELECT value FROM ledger", false))
+            .unwrap();
+        let mut closing = Box::pin(backend.close());
+        assert!(closing.as_mut().now_or_never().is_none());
+        Backend::run(connection, commands, &backend.admission);
+        let result = failing.await.unwrap();
+        assert!(matches!(result,
+            Err(Error::Rusqlite(rusqlite::Error::SqliteFailure(error, _)))
+            if error.code == rusqlite::ErrorCode::AuthorizationForStatementDenied
+        ));
+        assert!(pending.await.is_err());
+        assert!(matches!(closing.await, Err(Error::OutcomeUnknown { .. })));
+        let connection = Connection::open(path).unwrap();
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM ledger", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    });
 }
 
 #[test]
-fn worker_exit_releases_sql_and_close_waiters() {
-    struct PanicOnDrop;
-    impl Drop for PanicOnDrop {
-        fn drop(&mut self) {
-            panic!("canceled closure destructor");
+fn close_is_shared_and_failure_allows_retry() {
+    smol::block_on(async {
+        let (backend, commands) = backend(None);
+        let mut first = Box::pin(backend.close());
+        let mut second = Box::pin(backend.close());
+        assert!(first.as_mut().now_or_never().is_none());
+        assert!(second.as_mut().now_or_never().is_none());
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(commands.try_recv(), Ok(Command::Shutdown)));
+        finish_close(&backend.admission, Err("unfinished statement".into()));
+        for result in [first.await, second.await] {
+            assert!(
+                matches!(result, Err(Error::OutcomeUnknown { message }) if message == "unfinished statement")
+            );
+        }
+        let mut retry = Box::pin(backend.close());
+        assert!(retry.as_mut().now_or_never().is_none());
+        assert!(matches!(commands.try_recv(), Ok(Command::Shutdown)));
+        finish_close(&backend.admission, Ok(()));
+        retry.await.unwrap();
+        backend.close().await.unwrap();
+    });
+}
+
+#[test]
+fn worker_panic_releases_pending_sql_and_close_waiters() {
+    struct PanicOnWake;
+    impl Wake for PanicOnWake {
+        fn wake(self: Arc<Self>) {
+            panic!("reply wake panic");
         }
     }
 
     smol::block_on(async {
-        let client = ClientBuilder::new().open().await.unwrap();
-        let (running, release) = block(&client);
-        let destructor = PanicOnDrop;
-        let mut canceled = Box::pin(client.conn(move |_| {
-            drop(destructor);
-            Ok(())
-        }));
-        assert!(canceled.as_mut().now_or_never().is_none());
-        drop(canceled);
-        let mut query = Box::pin(client.execute_batch("CREATE TABLE discarded (value)"));
-        assert!(query.as_mut().now_or_never().is_none());
-        let mut closing = Box::pin(client.close());
+        let (backend, commands) = backend(None);
+        let mut first = backend.submit(batch("SELECT 1", false)).unwrap();
+        let waker = Waker::from(Arc::new(PanicOnWake));
+        assert!(matches!(
+            first.poll_unpin(&mut Context::from_waker(&waker)),
+            Poll::Pending
+        ));
+        let pending = backend.submit(batch("SELECT 2", false)).unwrap();
+        let mut closing = Box::pin(backend.close());
         assert!(closing.as_mut().now_or_never().is_none());
-        let (complete, blocking) = oneshot::channel();
-        let clone = client.clone();
-        let close_thread = thread::spawn(move || {
-            _ = complete.send(clone.close_blocking());
+        let admission = backend.admission.clone();
+        let worker = thread::spawn(move || {
+            Backend::run(Connection::open_in_memory().unwrap(), commands, &admission)
         });
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let admission = client.backend.admission.lock().unwrap();
-            if matches!(&*admission, Admission::Closing(replies) if replies.len() == 2) {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "blocking close was not registered"
-            );
-            drop(admission);
-            thread::yield_now();
-        }
-
-        release.send(()).unwrap();
-        running.await.unwrap();
-        let outcome = smol::future::race(
-            async { Some((query.await, closing.await, blocking.await.unwrap())) },
-            async {
-                smol::Timer::after(Duration::from_secs(5)).await;
-                None
-            },
-        )
-        .await;
-        if outcome.is_none() {
-            let previous = {
-                let mut admission = client.backend.admission.lock().unwrap();
-                core::mem::replace(&mut *admission, Admission::Closed)
-            };
-            drop(previous);
-        }
-        close_thread.join().unwrap();
+        assert!(worker.join().is_err());
+        assert!(pending.await.is_err());
+        let result = closing.as_mut().now_or_never();
         assert!(
-            matches!(
-                outcome,
-                Some((
-                    Err(Error::OutcomeUnknown { .. }),
-                    Err(Error::OutcomeUnknown { .. }),
-                    Ok(())
-                ))
-            ),
-            "{outcome:?}"
+            matches!(result, Some(Err(Error::OutcomeUnknown { .. }))),
+            "{result:?}"
         );
         assert!(matches!(
-            *client.backend.admission.lock().unwrap(),
+            *backend.admission.lock().unwrap(),
             Admission::Closed
         ));
     });

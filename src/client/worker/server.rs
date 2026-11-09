@@ -60,6 +60,7 @@ impl Drop for Listener {
 /// Serves SQL operations on this dedicated worker's connection.
 ///
 /// Initialize the browser VFS, connection and schema before calling this function.
+/// The connection must have no active transaction.
 /// Await this future until close; dropping it stops serving. Propagate serving
 /// failures as uncaught worker errors so callers can settle pending requests.
 /// Use [`serve_with_shutdown`] when the VFS holds resources beyond SQLite close.
@@ -69,8 +70,8 @@ pub async fn serve(connection: Connection) -> Result<(), JsValue> {
 
 /// Serves operations and releases application resources before acknowledging close.
 ///
-/// Follows [`serve`]'s contract. On orderly close, `shutdown` runs once after
-/// SQLite closes successfully and before the close reply, so it can release VFS
+/// Follows [`serve`]'s contract. On orderly close or invalid initialization,
+/// `shutdown` runs once after SQLite closes and before replying, releasing VFS
 /// locks before a replacement worker opens the database. A cleanup error fails
 /// close with [`crate::Error::OutcomeUnknown`] and terminates the session.
 /// The callback does not run on protocol failure or when this future is dropped.
@@ -78,14 +79,41 @@ pub async fn serve_with_shutdown(
     mut connection: Connection,
     shutdown: impl FnOnce() -> Result<(), JsValue>,
 ) -> Result<(), JsValue> {
+    if !connection.is_autocommit() {
+        let reason = "database initialized with an active transaction";
+        let result = connection
+            .close()
+            .map_err(|(_, error)| error.to_string())
+            .and_then(|()| {
+                shutdown().map_err(|error| format!("database shutdown failed: {error:?}"))
+            });
+        let message = match result {
+            Ok(()) => reason.to_owned(),
+            Err(error) => format!("{reason}; cleanup failed: {error}"),
+        };
+        return report_startup_error(message).await;
+    }
     let mut listener = Listener::new()?;
     listener.send(&Response::Ready)?;
     while let Some(request) = listener.messages.next().await {
         match request {
             Ok(Request::Hello) => listener.send(&Response::Ready)?,
             Ok(Request::Call { id, request }) => {
+                let requires_autocommit = matches!(
+                    &request,
+                    sql::Request::Rollback
+                        | sql::Request::Sql {
+                            in_transaction: false,
+                            ..
+                        }
+                );
                 let result = sql::handle(&mut connection, request).map_err(Into::into);
                 listener.send(&Response::Reply { id, result })?;
+                if requires_autocommit && !connection.is_autocommit() {
+                    let message = "database transaction cleanup failed";
+                    listener.send(&Response::Failed(message.into()))?;
+                    return Err(JsValue::from_str(message));
+                }
             }
             Ok(Request::Close) => {
                 let result = connection

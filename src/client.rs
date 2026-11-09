@@ -1,5 +1,7 @@
 use crate::Error;
-use core::future::Future;
+use futures_channel::oneshot;
+use futures_util::lock::{Mutex, OwnedMutexGuard};
+use std::sync::Arc;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
@@ -9,7 +11,7 @@ use native::Backend;
 pub use native::{ClientBuilder, JournalMode};
 
 mod sql;
-pub use sql::{Params, Row};
+pub use sql::{parameters, row, Operation, Params, Response, Row};
 
 #[cfg(all(
     feature = "sqlite-wasm-rs",
@@ -30,125 +32,182 @@ use worker::Backend;
 ))]
 pub use worker::{report_startup_error, serve, serve_with_shutdown};
 
+macro_rules! sql_methods {
+    () => {
+        /// Executes one SQL statement and returns the number of changed rows.
+        pub fn execute(
+            &self,
+            sql: &str,
+            params: impl $crate::Params,
+        ) -> impl core::future::Future<Output = Result<usize, $crate::Error>> + Send + '_ {
+            let request = $crate::client::parameters(params).map(|params| {
+                $crate::client::Operation::Execute {
+                    sql: sql.to_owned(),
+                    params,
+                }
+            });
+            async move {
+                match self.dispatch(request?).await? {
+                    $crate::client::Response::Changes(changes) => Ok(changes),
+                    _ => Err($crate::Error::Remote {
+                        message: "unexpected execute response".into(),
+                    }),
+                }
+            }
+        }
+
+        /// Maps the first result row on the caller, or returns `QueryReturnedNoRows`.
+        ///
+        /// The mapper receives an owned snapshot rather than a live SQLite statement.
+        /// Write statements finish before mapping.
+        pub fn query_row<'a, T, F>(
+            &'a self,
+            sql: &str,
+            params: impl $crate::Params,
+            map: F,
+        ) -> impl core::future::Future<Output = Result<T, $crate::Error>> + Send + 'a
+        where
+            T: 'a,
+            F: FnOnce(&$crate::Row<'_>) -> $crate::rusqlite::Result<T> + Send + 'a,
+        {
+            let request =
+                $crate::client::parameters(params).map(|params| $crate::client::Operation::Query {
+                    sql: sql.to_owned(),
+                    params,
+                    first_only: true,
+                });
+            async move {
+                match self.dispatch(request?).await? {
+                    $crate::client::Response::Rows { columns, rows } => {
+                        let values = rows
+                            .first()
+                            .ok_or($crate::rusqlite::Error::QueryReturnedNoRows)?;
+                        map(&$crate::client::row(&columns, values)).map_err(Into::into)
+                    }
+                    _ => Err($crate::Error::Remote {
+                        message: "unexpected query response".into(),
+                    }),
+                }
+            }
+        }
+
+        /// Collects result rows and maps them on the caller.
+        ///
+        /// All rows are buffered before mapping; this method does not stream results.
+        pub fn query_map<'a, T, F>(
+            &'a self,
+            sql: &str,
+            params: impl $crate::Params,
+            mut map: F,
+        ) -> impl core::future::Future<Output = Result<Vec<T>, $crate::Error>> + Send + 'a
+        where
+            T: 'a,
+            F: FnMut(&$crate::Row<'_>) -> $crate::rusqlite::Result<T> + Send + 'a,
+        {
+            let request =
+                $crate::client::parameters(params).map(|params| $crate::client::Operation::Query {
+                    sql: sql.to_owned(),
+                    params,
+                    first_only: false,
+                });
+            async move {
+                match self.dispatch(request?).await? {
+                    $crate::client::Response::Rows { columns, rows } => rows
+                        .iter()
+                        .map(|values| {
+                            map(&$crate::client::row(&columns, values)).map_err(Into::into)
+                        })
+                        .collect(),
+                    _ => Err($crate::Error::Remote {
+                        message: "unexpected query response".into(),
+                    }),
+                }
+            }
+        }
+
+        /// Executes SQL statements in order on the connection owner.
+        ///
+        /// Use a [`Transaction`](crate::Transaction) for atomic work. Outside a
+        /// managed transaction, a batch must finish any transaction it starts.
+        /// Earlier statements may have committed when a later statement fails.
+        pub fn execute_batch(
+            &self,
+            sql: &str,
+        ) -> impl core::future::Future<Output = Result<(), $crate::Error>> + Send + '_ {
+            let request = $crate::client::Operation::Batch {
+                sql: sql.to_owned(),
+            };
+            async move {
+                match self.dispatch(request).await? {
+                    $crate::client::Response::Done => Ok(()),
+                    _ => Err($crate::Error::Remote {
+                        message: "unexpected batch response".into(),
+                    }),
+                }
+            }
+        }
+    };
+}
+
+mod transaction;
+
 /// A connection whose SQL executes on a native thread or a browser database worker.
 ///
-/// SQL methods copy parameters before returning their future. Polling admits the
-/// operation; dropping its future afterward does not cancel it. Row mappers run
-/// on the caller; mapping errors do not roll back SQL. SQL methods require a
-/// connection outside a transaction. Native closures retain their own behavior.
+/// Parameters are copied before a future is returned. Admitted SQL survives
+/// cancellation, and row mapping runs on the caller. Clones share one connection;
+/// ordinary calls wait while a [`Transaction`] reserves it.
 #[derive(Clone)]
 pub struct Client {
     backend: Backend,
+    reservation: Arc<Mutex<()>>,
+}
+
+/// An exclusive transaction on one client or pool connection.
+///
+/// Dropping this handle queues rollback before releasing the connection. Use
+/// [`Self::commit`] or [`Self::rollback`] to end it. Transaction-control SQL in
+/// query or batch methods is unsupported. Mapping errors leave it active.
+pub struct Transaction {
+    client: Client,
+    reservation: Option<OwnedMutexGuard<()>>,
 }
 
 impl Client {
-    /// Executes one SQL statement and returns the number of changed rows.
-    pub fn execute(
-        &self,
-        sql: &str,
-        params: impl Params,
-    ) -> impl Future<Output = Result<usize, Error>> + Send + '_ {
-        let request = sql::parameters(params).map(|params| sql::Request::Execute {
-            sql: sql.to_owned(),
-            params,
-        });
-        async move {
-            match self.backend.dispatch(request?).await? {
-                sql::Response::Changes(changes) => Ok(changes),
-                _ => Err(Error::Remote {
-                    message: "unexpected execute response".into(),
-                }),
-            }
+    fn from_backend(backend: Backend) -> Self {
+        Self {
+            backend,
+            reservation: Arc::new(Mutex::new(())),
         }
     }
 
-    /// Maps the first result row on the caller, or returns `QueryReturnedNoRows`.
-    ///
-    /// The mapper receives an owned snapshot rather than a live SQLite statement.
-    /// Write statements finish before returning so commit errors propagate.
-    pub fn query_row<'a, T, F>(
-        &'a self,
-        sql: &str,
-        params: impl Params,
-        map: F,
-    ) -> impl Future<Output = Result<T, Error>> + Send + 'a
-    where
-        T: 'a,
-        F: FnOnce(&Row<'_>) -> rusqlite::Result<T> + Send + 'a,
-    {
-        let request = sql::parameters(params).map(|params| sql::Request::Query {
-            sql: sql.to_owned(),
-            params,
-            first_only: true,
-        });
-        async move {
-            match self.backend.dispatch(request?).await? {
-                sql::Response::Rows { columns, rows } => {
-                    let values = rows.first().ok_or(rusqlite::Error::QueryReturnedNoRows)?;
-                    map(&sql::row(&columns, values)).map_err(Into::into)
-                }
-                _ => Err(Error::Remote {
-                    message: "unexpected query response".into(),
-                }),
-            }
-        }
+    sql_methods!();
+
+    async fn dispatch(&self, operation: Operation) -> Result<Response, Error> {
+        dispatch(self, operation).await
     }
 
-    /// Collects result rows and maps them on the caller.
+    /// Reserves this connection and starts an immediate transaction.
     ///
-    /// All rows are buffered before mapping; this method does not stream results.
-    pub fn query_map<'a, T, F>(
-        &'a self,
-        sql: &str,
-        params: impl Params,
-        mut map: F,
-    ) -> impl Future<Output = Result<Vec<T>, Error>> + Send + 'a
-    where
-        T: 'a,
-        F: FnMut(&Row<'_>) -> rusqlite::Result<T> + Send + 'a,
-    {
-        let request = sql::parameters(params).map(|params| sql::Request::Query {
-            sql: sql.to_owned(),
-            params,
-            first_only: false,
-        });
-        async move {
-            match self.backend.dispatch(request?).await? {
-                sql::Response::Rows { columns, rows } => rows
-                    .iter()
-                    .map(|values| map(&sql::row(&columns, values)).map_err(Into::into))
-                    .collect(),
-                _ => Err(Error::Remote {
-                    message: "unexpected query response".into(),
-                }),
-            }
-        }
-    }
-
-    /// Executes SQL statements in order on the connection owner.
-    ///
-    /// Use a complete `BEGIN`/`COMMIT` transaction for atomic batches. A transaction
-    /// left open or interrupted by an error is rolled back. Statements outside a
-    /// transaction may already have committed when a later statement fails.
-    pub fn execute_batch(&self, sql: &str) -> impl Future<Output = Result<(), Error>> + Send + '_ {
-        let request = sql::Request::Batch {
-            sql: sql.to_owned(),
+    /// Other calls on this client wait until the transaction finishes or is
+    /// dropped. Canceling acquisition after admission queues rollback.
+    pub async fn transaction(&self) -> Result<Transaction, Error> {
+        let reservation = self.reservation.clone().lock_owned().await;
+        let reply = self.backend.submit(sql::Request::Begin)?;
+        let transaction = Transaction {
+            client: self.clone(),
+            reservation: Some(reservation),
         };
-        async move {
-            match self.backend.dispatch(request).await? {
-                sql::Response::Done => Ok(()),
-                _ => Err(Error::Remote {
-                    message: "unexpected batch response".into(),
-                }),
-            }
-        }
+        done(receive(reply).await?)?;
+        Ok(transaction)
     }
 
-    /// Stops SQL admission, drains accepted work and closes the connection.
+    /// Waits for active transactions, then drains accepted work and closes SQLite.
     ///
-    /// Closing is shared by cloned clients. Dropping a waiting future does not
-    /// cancel an accepted close. Successful close can be repeated.
+    /// Finish or drop a transaction before awaiting close on the same task.
+    /// Dropping an admitted close future does not cancel shutdown. Successful
+    /// close can be repeated across cloned clients.
     pub async fn close(&self) -> Result<(), Error> {
+        let _reservation = self.reservation.lock().await;
         self.backend.close().await
     }
 
@@ -162,9 +221,7 @@ impl Client {
         target_os = "unknown"
     ))]
     pub async fn connect(worker: web_sys::Worker) -> Result<Self, Error> {
-        Ok(Self {
-            backend: Backend::connect(worker).await?,
-        })
+        Ok(Self::from_backend(Backend::connect(worker).await?))
     }
 
     /// Terminates the browser database worker without promising rollback.
@@ -178,4 +235,31 @@ impl Client {
     pub fn terminate(&self) {
         self.backend.terminate();
     }
+}
+
+async fn receive(reply: oneshot::Receiver<Result<Response, Error>>) -> Result<Response, Error> {
+    reply.await.map_err(|error| Error::OutcomeUnknown {
+        message: error.to_string(),
+    })?
+}
+
+fn done(response: Response) -> Result<(), Error> {
+    match response {
+        Response::Done => Ok(()),
+        _ => Err(Error::Remote {
+            message: "unexpected transaction response".into(),
+        }),
+    }
+}
+
+/// Admits ordinary SQL while no transaction reserves the chosen connection.
+pub async fn dispatch(client: &Client, operation: Operation) -> Result<Response, Error> {
+    let reply = {
+        let _reservation = client.reservation.lock().await;
+        client.backend.submit(sql::Request::Sql {
+            operation,
+            in_transaction: false,
+        })?
+    };
+    receive(reply).await
 }

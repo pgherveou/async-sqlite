@@ -4,7 +4,7 @@ This file provides guidance to AI agents when working with code in this reposito
 
 ## Project Overview
 
-async-sqlite is a Rust library providing an asynchronous, runtime-agnostic wrapper around SQLite via `rusqlite`. It works with any async runtime (tokio, smol, etc.) by using background threads internally rather than depending on a specific runtime.
+async-sqlite is a Rust library providing an asynchronous, runtime-agnostic wrapper around SQLite via `rusqlite`. SQL runs on a native background thread or a browser database worker, without depending on a specific runtime.
 
 ## Build Commands
 
@@ -17,24 +17,24 @@ cargo clippy -- -D warnings    # Lint (CI treats all warnings as errors)
 
 To run a single test:
 ```bash
-cargo test <test_name>         # e.g., cargo test test_blocking_client
+cargo test <test_name>         # e.g., cargo test transaction
 ```
 
 The minimum supported Rust version is 1.95.0.
 
 ## Architecture
 
-The library has three core types in `src/`:
+The library exposes SQL clients, transactions and native pools:
 
-- **Client** (`client.rs`): Shared SQL methods over a platform backend. `client/native.rs` owns the connection thread, queue and native closure methods. `client/worker/` owns browser messages and lifecycle. `client/sql.rs` converts parameters, executes SQL and maps owned rows on the caller. Client is cheaply cloneable.
+- **Client** (`client.rs`): Shared SQL methods over a platform backend. `client/native.rs` owns connection setup and the SQL queue. `client/worker/` owns browser messages and lifecycle. `client/sql.rs` converts parameters and executes SQL; one macro defines SQL methods for Client, Transaction and Pool. Client clones share a transaction reservation.
 
-- **Pool** (`pool.rs`): Manages multiple `Client` instances with round-robin selection via an atomic counter. Provides the same API as Client plus `conn_for_each()` for executing on all connections. File-backed and named shared-memory pools default to CPU-count connections; anonymous in-memory pools default to one connection and reject explicit multi-connection configuration. `PoolBuilder::queue_capacity()` applies the same per-client queue bound to every pool connection.
+- **Pool** (`pool.rs`): Manages multiple `Client` instances with round-robin selection via an atomic counter. Forwards the shared SQL API and reserves one connection for each transaction. `open_with` initializes every connection before the pool is returned. File-backed and named shared-memory pools default to CPU-count connections; anonymous in-memory pools default to one connection and reject explicit multi-connection configuration. `PoolBuilder::queue_capacity()` applies the same per-client queue bound to every pool connection.
 
 - **Error** (`error.rs`): Non-exhaustive enum wrapping config errors, queue-full errors, `rusqlite::Error`, channel errors, panics, and pragma failures.
 
-Native Client and Pool retain closure methods (e.g., `conn(|conn| { ... })`) with blocking and async variants.
+Transaction holds an owned reservation across awaits. Commit and rollback consume it; Drop queues rollback before releasing the reservation. Native construction uses ClientBuilder/PoolBuilder; browser construction uses Client::connect and serve.
 
-Admitted SQL requests survive caller cancellation; queued native closure calls retain their cancellation behavior. Native async and blocking close share shutdown admission. Keep transport commands internal. Row mappers run on the caller, and each SQL request must finish its transaction. Never replay requests after an unknown outcome.
+Admitted SQL survives caller cancellation. Canceled commits may already have committed. Cleanup bypasses native queue limits but stays in the same FIFO; cleanup failure closes the connection. Close waits for transactions, then drains admitted SQL. Keep transport types internal, preserve application connection hooks, and never replay a request after an unknown outcome.
 
 ## Features
 
@@ -42,7 +42,7 @@ SQLite Cargo features are pass-through to `rusqlite`. The `rusqlite` dependency 
 
 ## Releases
 
-Version 0.7.0 uses rusqlite 0.41. The library exposes rusqlite types in its public API. Treat incompatible rusqlite upgrades as breaking changes; before version 1.0, increment the minor version.
+Version 0.8.0 uses rusqlite 0.41. The library exposes rusqlite types in its public API. Treat incompatible rusqlite upgrades as breaking changes; before version 1.0, increment the minor version.
 
 ## Testing
 
