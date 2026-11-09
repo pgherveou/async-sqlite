@@ -26,15 +26,15 @@ The minimum supported Rust version is 1.95.0.
 
 The library has three core types in `src/`:
 
-- **Client** (`client.rs`): Wraps a single SQLite connection. Spawns a background `std::thread` that receives commands (closures) via a `crossbeam_channel`. Results are returned through `futures_channel::oneshot`. Queued async commands are skipped if their reply channel is already canceled, and `ClientBuilder::queue_capacity()` can bound the worker queue. This design makes it runtime-agnostic. Client is cheaply cloneable.
+- **Client** (`client.rs`): Shared SQL methods over a platform backend. `client/native.rs` owns the connection thread, queue and native closure methods. `client/worker/` owns browser messages and lifecycle. `client/sql.rs` converts parameters, executes SQL and maps owned rows on the caller. Client is cheaply cloneable.
 
 - **Pool** (`pool.rs`): Manages multiple `Client` instances with round-robin selection via an atomic counter. Provides the same API as Client plus `conn_for_each()` for executing on all connections. File-backed and named shared-memory pools default to CPU-count connections; anonymous in-memory pools default to one connection and reject explicit multi-connection configuration. `PoolBuilder::queue_capacity()` applies the same per-client queue bound to every pool connection.
 
 - **Error** (`error.rs`): Non-exhaustive enum wrapping config errors, queue-full errors, `rusqlite::Error`, channel errors, panics, and pragma failures.
 
-The Client and Pool APIs use closures (e.g., `conn(|conn| { ... })`) to avoid lifetime issues with the cross-thread boundary. Both blocking and async variants exist for these operations.
+Native Client and Pool retain closure methods (e.g., `conn(|conn| { ... })`) with blocking and async variants.
 
-`src/database.rs` defines the typed service; `src/database/native.rs` uses Client threads and `src/worker/` uses browser workers. Admitted service requests survive caller cancellation. Preserve the closure API's separate cancellation behavior; never replay requests after an unknown outcome.
+Admitted SQL requests survive caller cancellation; queued native closure calls retain their cancellation behavior. Keep transport commands internal. Row mappers run on the caller, and each SQL request must finish its transaction. Never replay requests after an unknown outcome.
 
 ## Features
 
@@ -48,4 +48,4 @@ Version 0.7.0 uses rusqlite 0.41. The library exposes rusqlite types in its publ
 
 Tests in `tests/tests.rs` use a `async_test!` macro that generates two variants of each async test: one running on tokio and one on smol. This ensures runtime compatibility. Tests use `tempfile` for temporary database files.
 
-`tests/database.rs` covers the typed service. The standalone worker example linked from README owns browser integration tests.
+`tests/database.rs` covers the SQL API and lifecycle. The standalone worker example linked from README owns browser integration tests.

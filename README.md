@@ -35,15 +35,15 @@ let client = ClientBuilder::new()
                 .open()
                 .await?;
 
-let value: String = client.conn(|conn| {
-    conn.query_row("SELECT val FROM testing WHERE id=?", [1], |row| row.get(0))
-}).await?;
+let value: String = client
+    .query_row("SELECT val FROM testing WHERE id=?", [1], |row| row.get(0))
+    .await?;
 
 println!("Value is: {value}");
 ```
 
-Async operations that are queued and then canceled before the worker starts
-them are skipped. `ClientBuilder::queue_capacity()` and
+Native `conn` calls canceled before the worker starts them are skipped.
+`ClientBuilder::queue_capacity()` and
 `PoolBuilder::queue_capacity()` can be used to bound worker queues; operations
 return `Error::QueueFull` when the selected queue is full.
 
@@ -88,28 +88,18 @@ can be disabled with the following line in your Cargo.toml:
 async-sqlite = { version = "*", default-features = false }
 ```
 
-## Typed database services
+## Browser support
 
-`DatabaseBackend` provides a typed API. `NativeDatabase` dispatches requests to a
-`Client` connection thread. The `sqlite-wasm-rs` feature adds
-`WorkerDatabase` for `wasm32-unknown-unknown`, running the same Rust handler in a
-dedicated browser worker with serde/postcard messages.
+The `sqlite-wasm-rs` feature enables `Client::connect(worker)` on
+`wasm32-unknown-unknown`. The database worker initializes its VFS and schema, then
+awaits `serve(connection)`. Use `serve_with_shutdown` to release VFS resources on close.
 
-```rust
-use async_sqlite::{ClientBuilder, DatabaseBackend, NativeDatabase};
+Both backends provide `execute`, `query_row`, `query_map` and `execute_batch`.
+Row mappers run on the caller over buffered results. Native `conn` methods remain
+available for direct rusqlite access, including transactions that branch in Rust.
 
-let client = ClientBuilder::new().open().await?;
-let database = NativeDatabase::new(client, |connection, value: i64| {
-    connection.query_row("SELECT ?1 + 1", [value], |row| row.get::<_, i64>(0))
-});
-assert_eq!(database.call(41).await?, 42);
-database.close().await?;
-```
-
-Handlers own transaction boundaries. Dropping a waiting future does not cancel
-an admitted request. `CallError::OutcomeUnknown` can follow a committed write;
-requests are never automatically retried. `close()` drains accepted work.
+Accepted SQL operations survive caller cancellation. A lost reply produces
+`Error::OutcomeUnknown`; a write may have committed and is never automatically retried.
 
 See the [worker example](https://github.com/pgherveou/async-sqlite-worker-example)
-for a shared native/browser handler and OPFS tests. Run
-`cargo test` for the library's tests.
+for shared SQL calls and OPFS tests. Run `cargo test` for the library's tests.

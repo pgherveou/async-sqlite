@@ -23,18 +23,18 @@
 //!                 .open()
 //!                 .await?;
 //!
-//! let value: String = client.conn(|conn| {
-//!     conn.query_row("SELECT val FROM testing WHERE id=?", [1], |row| row.get(0))
-//! }).await?;
+//! let value: String = client
+//!     .query_row("SELECT val FROM testing WHERE id=?", [1], |row| row.get(0))
+//!     .await?;
 //!
 //! println!("Value is: {value}");
 //! # Ok(())
 //! }
 //! ```
 //!
-//! Async operations that are queued and then canceled before the worker starts
-//! them are skipped. [`ClientBuilder::queue_capacity()`] and
-//! [`PoolBuilder::queue_capacity()`] can be used to bound worker queues;
+//! Native `conn` calls canceled before the worker starts them are skipped.
+//! `ClientBuilder::queue_capacity()` and
+//! `PoolBuilder::queue_capacity()` can be used to bound worker queues;
 //! operations return [`Error::QueueFull`] when the selected queue is full.
 //!
 //! A `Pool` represents a collection of background sqlite3 connections that can be
@@ -83,9 +83,13 @@
 
 pub use rusqlite;
 
+#[cfg(any(
+    not(target_arch = "wasm32"),
+    all(feature = "sqlite-wasm-rs", target_os = "unknown")
+))]
 mod client;
-mod database;
 mod error;
+#[cfg(not(target_arch = "wasm32"))]
 mod pool;
 
 #[cfg(all(
@@ -93,18 +97,14 @@ mod pool;
     target_arch = "wasm32",
     target_os = "unknown"
 ))]
-mod worker;
-
-pub use client::{Client, ClientBuilder, JournalMode};
-#[cfg(not(target_arch = "wasm32"))]
-pub use database::NativeDatabase;
-pub use database::{CallError, DatabaseBackend};
-pub use error::Error;
-pub use pool::{Pool, PoolBuilder};
-
-#[cfg(all(
-    feature = "sqlite-wasm-rs",
-    target_arch = "wasm32",
-    target_os = "unknown"
+pub use client::{report_startup_error, serve, serve_with_shutdown};
+#[cfg(any(
+    not(target_arch = "wasm32"),
+    all(feature = "sqlite-wasm-rs", target_os = "unknown")
 ))]
-pub use worker::{report_startup_error, serve, serve_with_shutdown, WorkerDatabase};
+pub use client::{Client, Params, Row};
+#[cfg(not(target_arch = "wasm32"))]
+pub use client::{ClientBuilder, JournalMode};
+pub use error::Error;
+#[cfg(not(target_arch = "wasm32"))]
+pub use pool::{Pool, PoolBuilder};

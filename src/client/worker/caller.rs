@@ -1,4 +1,3 @@
-use core::{convert::Infallible, marker::PhantomData};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -6,38 +5,24 @@ use std::{
 
 use futures_channel::{mpsc, oneshot};
 use futures_util::{
-    future::{select, BoxFuture, Either},
+    future::{select, Either},
     StreamExt,
 };
 use js_sys::Uint8Array;
-use serde::{de::DeserializeOwned, Serialize};
 use wasm_bindgen::{closure::Closure, JsCast};
 use web_sys::{ErrorEvent, Event, MessageEvent, Worker};
 
+use super::super::sql;
 use super::wire::{Request, Response};
-use crate::{CallError, DatabaseBackend};
+use crate::Error;
 
-type Reply = oneshot::Sender<Result<Vec<u8>, Failure>>;
+type Reply = oneshot::Sender<Result<sql::Response, Error>>;
 type CloseReply = oneshot::Sender<Result<(), String>>;
 
 enum Command {
-    Call { payload: Vec<u8>, reply: Reply },
+    Call { request: sql::Request, reply: Reply },
     Close,
     Terminate,
-}
-
-enum Failure {
-    NotDispatched(String),
-    Unknown(String),
-}
-
-impl Failure {
-    fn into_call_error<OperationError>(self) -> CallError<OperationError> {
-        match self {
-            Self::NotDispatched(reason) => CallError::NotDispatched(reason),
-            Self::Unknown(reason) => CallError::OutcomeUnknown(reason),
-        }
-    }
 }
 
 enum Phase {
@@ -110,55 +95,39 @@ impl Drop for Session {
     }
 }
 
-/// A typed request handle to an independently running database worker.
-///
-/// The handle contains only channels and admission state, so it can be cloned
-/// and used by `Send` futures. Browser objects stay on the event loop that calls
-/// `connect`. Requests use an unbounded queue and are never automatically retried.
-/// Dropping a waiting future does not cancel an admitted operation.
-/// Closing drains admitted requests, closes SQLite, and terminates the worker.
-/// A close failure also terminates the worker and cannot be retried on this handle.
-pub struct WorkerDatabase<RequestValue, ResponseValue, OperationError> {
+/// A channel handle to a database worker owned by the connecting event loop.
+#[derive(Clone)]
+pub struct Backend {
     commands: mpsc::UnboundedSender<Command>,
     phase: Arc<Mutex<Phase>>,
-    protocol: PhantomData<fn(RequestValue) -> Result<ResponseValue, OperationError>>,
 }
 
-impl<RequestValue, ResponseValue, OperationError> Clone
-    for WorkerDatabase<RequestValue, ResponseValue, OperationError>
-{
-    fn clone(&self) -> Self {
-        Self {
-            commands: self.commands.clone(),
-            phase: self.phase.clone(),
-            protocol: PhantomData,
-        }
-    }
-}
-
-impl<RequestValue, ResponseValue, OperationError>
-    WorkerDatabase<RequestValue, ResponseValue, OperationError>
-{
+impl Backend {
     /// Takes ownership of a worker and waits for its database to be ready.
     ///
     /// The worker must call `serve` or `report_startup_error`. This method owns
     /// its message and error handlers and terminates it on startup failure or
     /// cancellation. A silent worker needs an application-owned startup timeout.
-    pub async fn connect(worker: Worker) -> Result<Self, String> {
+    pub async fn connect(worker: Worker) -> Result<Self, Error> {
         let (session, mut events) = Session::new(worker);
-        session.send(&Request::Hello)?;
-        match events.next().await {
-            Some(WorkerEvent::Message(bytes)) => match postcard::from_bytes(&bytes) {
-                Ok(Response::Ready) => {}
-                Ok(Response::StartupError(reason) | Response::Failed(reason)) => {
-                    return Err(reason)
-                }
-                Ok(_) => return Err("database sent a reply before readiness".into()),
-                Err(error) => return Err(error.to_string()),
-            },
-            Some(WorkerEvent::Failed(reason)) => return Err(reason),
-            None => return Err("database worker disconnected during startup".into()),
+        let ready = async {
+            session.send(&Request::Hello)?;
+            match events.next().await {
+                Some(WorkerEvent::Message(bytes)) => match postcard::from_bytes(&bytes) {
+                    Ok(Response::Ready) => {}
+                    Ok(Response::StartupError(reason) | Response::Failed(reason)) => {
+                        return Err(reason)
+                    }
+                    Ok(_) => return Err("database sent a reply before readiness".into()),
+                    Err(error) => return Err(error.to_string()),
+                },
+                Some(WorkerEvent::Failed(reason)) => return Err(reason),
+                None => return Err("database worker disconnected during startup".into()),
+            }
+            Ok(())
         }
+        .await;
+        ready.map_err(|message| Error::NotDispatched { message })?;
         let (commands, receiver) = mpsc::unbounded();
         let phase = Arc::new(Mutex::new(Phase::Open));
         let bridge = Bridge {
@@ -172,11 +141,7 @@ impl<RequestValue, ResponseValue, OperationError>
             close_sent: false,
         };
         wasm_bindgen_futures::spawn_local(bridge.run());
-        Ok(Self {
-            commands,
-            phase,
-            protocol: PhantomData,
-        })
+        Ok(Self { commands, phase })
     }
 
     /// Stops admission and asks the owning event loop to terminate the worker.
@@ -199,7 +164,7 @@ impl<RequestValue, ResponseValue, OperationError>
         }
     }
 
-    fn admit(&self, payload: Vec<u8>, reply: Reply) -> Result<(), String> {
+    fn admit(&self, request: sql::Request, reply: Reply) -> Result<(), String> {
         let phase = self
             .phase
             .lock()
@@ -208,7 +173,7 @@ impl<RequestValue, ResponseValue, OperationError>
             return Err("database is closing or closed".into());
         }
         self.commands
-            .unbounded_send(Command::Call { payload, reply })
+            .unbounded_send(Command::Call { request, reply })
             .map_err(|_| "database worker disconnected".into())
     }
 
@@ -230,48 +195,25 @@ impl<RequestValue, ResponseValue, OperationError>
             }
         }
     }
-}
 
-impl<RequestValue, ResponseValue, OperationError> DatabaseBackend
-    for WorkerDatabase<RequestValue, ResponseValue, OperationError>
-where
-    RequestValue: Serialize + Send + 'static,
-    ResponseValue: DeserializeOwned + Send + 'static,
-    OperationError: DeserializeOwned + Send + 'static,
-{
-    type Request = RequestValue;
-    type Response = ResponseValue;
-    type Error = OperationError;
-
-    fn call(
-        &self,
-        request: RequestValue,
-    ) -> BoxFuture<'_, Result<ResponseValue, CallError<OperationError>>> {
-        Box::pin(async move {
-            let payload = postcard::to_allocvec(&request)
-                .map_err(|error| CallError::NotDispatched(error.to_string()))?;
-            let (reply, result) = oneshot::channel();
-            self.admit(payload, reply)
-                .map_err(CallError::NotDispatched)?;
-            let payload = result
-                .await
-                .map_err(|_| CallError::OutcomeUnknown("database worker disconnected".into()))?
-                .map_err(Failure::into_call_error)?;
-            let result: Result<ResponseValue, OperationError> = postcard::from_bytes(&payload)
-                .map_err(|error| CallError::OutcomeUnknown(error.to_string()))?;
-            result.map_err(CallError::Operation)
-        })
+    /// Dispatches SQL without canceling admitted work when its caller stops waiting.
+    pub async fn dispatch(&self, request: sql::Request) -> Result<sql::Response, Error> {
+        let (reply, result) = oneshot::channel();
+        self.admit(request, reply)
+            .map_err(|message| Error::NotDispatched { message })?;
+        result.await.map_err(|_| Error::OutcomeUnknown {
+            message: "database worker disconnected".into(),
+        })?
     }
 
-    fn close(&self) -> BoxFuture<'_, Result<(), CallError<Infallible>>> {
-        Box::pin(async move {
-            let (reply, result) = oneshot::channel();
-            self.begin_close(reply);
-            result
-                .await
-                .unwrap_or_else(|_| Err("database worker disconnected".into()))
-                .map_err(CallError::OutcomeUnknown)
-        })
+    /// Drains accepted work and closes SQLite before terminating its worker.
+    pub async fn close(&self) -> Result<(), Error> {
+        let (reply, result) = oneshot::channel();
+        self.begin_close(reply);
+        result
+            .await
+            .unwrap_or_else(|_| Err("database worker disconnected".into()))
+            .map_err(|message| Error::OutcomeUnknown { message })
     }
 }
 
@@ -314,11 +256,15 @@ impl Bridge {
         finish(&mut phase, result);
         self.commands.close();
         for (_, reply) in self.pending.drain() {
-            let _ = reply.send(Err(Failure::Unknown(reason.clone())));
+            let _ = reply.send(Err(Error::OutcomeUnknown {
+                message: reason.clone(),
+            }));
         }
         while let Ok(command) = self.commands.try_recv() {
             if let Command::Call { reply, .. } = command {
-                let _ = reply.send(Err(Failure::NotDispatched(reason.clone())));
+                let _ = reply.send(Err(Error::NotDispatched {
+                    message: reason.clone(),
+                }));
             }
         }
     }
@@ -340,12 +286,12 @@ impl Bridge {
                         .map_err(|error| error.to_string())?
                     {
                         Response::Ready => {}
-                        Response::Reply { id, payload } => {
+                        Response::Reply { id, result } => {
                             let reply = self
                                 .pending
                                 .remove(&id)
                                 .ok_or("database replied to an unknown request")?;
-                            let _ = reply.send(Ok(payload));
+                            let _ = reply.send(result.map_err(Into::into));
                         }
                         Response::Closed(result) => {
                             if !self.close_sent || !self.pending.is_empty() {
@@ -362,23 +308,25 @@ impl Bridge {
                 }
                 Incoming::Event(Some(WorkerEvent::Failed(reason))) => return Err(reason),
                 Incoming::Event(None) => return Err("database worker disconnected".into()),
-                Incoming::Command(Some(Command::Call { payload, reply })) => {
+                Incoming::Command(Some(Command::Call { request, reply })) => {
                     let id = self.next_id;
                     self.next_id = match id.checked_add(1) {
                         Some(next) => next,
                         None => {
-                            let _ = reply.send(Err(Failure::NotDispatched(
-                                "database request IDs exhausted".into(),
-                            )));
+                            let _ = reply.send(Err(Error::NotDispatched {
+                                message: "database request IDs exhausted".into(),
+                            }));
                             return Err("database request IDs exhausted".into());
                         }
                     };
-                    match self.session.send(&Request::Call { id, payload }) {
+                    match self.session.send(&Request::Call { id, request }) {
                         Ok(()) => {
                             self.pending.insert(id, reply);
                         }
                         Err(reason) => {
-                            let _ = reply.send(Err(Failure::NotDispatched(reason.clone())));
+                            let _ = reply.send(Err(Error::NotDispatched {
+                                message: reason.clone(),
+                            }));
                             return Err(reason);
                         }
                     }

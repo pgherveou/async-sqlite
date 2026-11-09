@@ -2,10 +2,10 @@ use futures_channel::mpsc;
 use futures_util::StreamExt;
 use js_sys::Uint8Array;
 use rusqlite::Connection;
-use serde::{de::DeserializeOwned, Serialize};
 use wasm_bindgen::{closure::Closure, JsCast, JsValue};
 use web_sys::{DedicatedWorkerGlobalScope, Event, MessageEvent};
 
+use super::super::sql;
 use super::wire::{Request, Response};
 
 struct Listener {
@@ -55,26 +55,14 @@ impl Drop for Listener {
     }
 }
 
-/// Serves application operations on this dedicated worker's connection.
+/// Serves SQL operations on this dedicated worker's connection.
 ///
 /// Initialize the browser VFS, connection and schema before calling this function.
-/// The handler runs synchronously and owns transaction boundaries. Requests are
-/// processed in order, including requests whose callers have stopped waiting.
-/// The future completes after close or a protocol failure; dropping it stops
-/// serving and drops the connection. It must be awaited or spawned locally.
-/// Close errors terminate this session and are reported to the caller. Propagate
-/// a serving error as an uncaught worker error so the caller detects lost replies.
+/// Await this future until close; dropping it stops serving. Propagate serving
+/// failures as uncaught worker errors so callers can settle pending requests.
 /// Use [`serve_with_shutdown`] when the VFS holds resources beyond SQLite close.
-pub async fn serve<RequestValue, ResponseValue, OperationError>(
-    connection: Connection,
-    handler: impl FnMut(&mut Connection, RequestValue) -> Result<ResponseValue, OperationError>,
-) -> Result<(), JsValue>
-where
-    RequestValue: DeserializeOwned,
-    ResponseValue: Serialize,
-    OperationError: Serialize,
-{
-    serve_with_shutdown(connection, handler, || Ok(())).await
+pub async fn serve(connection: Connection) -> Result<(), JsValue> {
+    serve_with_shutdown(connection, || Ok(())).await
 }
 
 /// Serves operations and releases application resources before acknowledging close.
@@ -82,18 +70,12 @@ where
 /// Follows [`serve`]'s contract. On orderly close, `shutdown` runs once after
 /// SQLite closes successfully and before the close reply, so it can release VFS
 /// locks before a replacement worker opens the database. A cleanup error fails
-/// close with [`crate::CallError::OutcomeUnknown`] and terminates the session.
+/// close with [`crate::Error::OutcomeUnknown`] and terminates the session.
 /// The callback does not run on protocol failure or when this future is dropped.
-pub async fn serve_with_shutdown<RequestValue, ResponseValue, OperationError>(
+pub async fn serve_with_shutdown(
     mut connection: Connection,
-    mut handler: impl FnMut(&mut Connection, RequestValue) -> Result<ResponseValue, OperationError>,
     shutdown: impl FnOnce() -> Result<(), JsValue>,
-) -> Result<(), JsValue>
-where
-    RequestValue: DeserializeOwned,
-    ResponseValue: Serialize,
-    OperationError: Serialize,
-{
+) -> Result<(), JsValue> {
     let mut listener = Listener::new()?;
     listener.send(&Response::Ready)?;
     while let Some(message) = listener.messages.next().await {
@@ -102,23 +84,9 @@ where
         });
         match request {
             Ok(Request::Hello) => listener.send(&Response::Ready)?,
-            Ok(Request::Call { id, payload }) => {
-                let request = match postcard::from_bytes(&payload) {
-                    Ok(request) => request,
-                    Err(error) => {
-                        listener.send(&Response::Failed(error.to_string()))?;
-                        return Err(JsValue::from_str(&error.to_string()));
-                    }
-                };
-                let result = handler(&mut connection, request);
-                let payload = match postcard::to_allocvec(&result) {
-                    Ok(payload) => payload,
-                    Err(error) => {
-                        listener.send(&Response::Failed(error.to_string()))?;
-                        return Err(JsValue::from_str(&error.to_string()));
-                    }
-                };
-                listener.send(&Response::Reply { id, payload })?;
+            Ok(Request::Call { id, request }) => {
+                let result = sql::handle(&mut connection, request).map_err(Into::into);
+                listener.send(&Response::Reply { id, result })?;
             }
             Ok(Request::Close) => {
                 let result = connection

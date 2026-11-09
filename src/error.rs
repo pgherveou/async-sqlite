@@ -6,6 +6,12 @@ pub enum Error {
     Closed,
     /// Indicates that the sqlite worker queue is full.
     QueueFull,
+    /// The SQL request was rejected before reaching the database.
+    NotDispatched { message: String },
+    /// A dispatched request lost its reply; a write may already have committed.
+    OutcomeUnknown { message: String },
+    /// A worker reported an error without a local rusqlite representation.
+    Remote { message: String },
     /// Invalid builder configuration.
     Config { message: &'static str },
     /// Error updating PRAGMA.
@@ -34,6 +40,9 @@ impl std::fmt::Display for Error {
         match self {
             Error::Closed => write!(f, "connection to sqlite database closed"),
             Error::QueueFull => write!(f, "sqlite worker queue is full"),
+            Error::NotDispatched { message } => write!(f, "request not dispatched: {message}"),
+            Error::OutcomeUnknown { message } => write!(f, "database outcome unknown: {message}"),
+            Error::Remote { message } => write!(f, "database worker error: {message}"),
             Error::Config { message } => write!(f, "invalid configuration: {message}"),
             Error::PragmaUpdate { exp, got, name } => {
                 write!(f, "updating pragma {name}: expected '{exp}', got '{got}'")

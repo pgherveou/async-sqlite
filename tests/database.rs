@@ -1,339 +1,291 @@
 #![cfg(not(target_arch = "wasm32"))]
 
-use std::sync::mpsc;
-use std::thread::{self, ThreadId};
+use std::{rc::Rc, sync::mpsc, thread};
 
-use async_sqlite::{CallError, Client, ClientBuilder, DatabaseBackend, NativeDatabase};
+use async_sqlite::{Client, ClientBuilder, Error};
 use futures_util::{future::BoxFuture, FutureExt};
-use rusqlite::{params, Connection};
+use rusqlite::params;
 
-enum Request {
-    Insert(i64, Vec<u8>),
-    Debit(i64),
-    Rows,
-    Thread,
-    Block(mpsc::Sender<()>, mpsc::Receiver<()>),
-    CommitThenPanic,
-}
-
-#[derive(Debug, PartialEq)]
-struct Record {
-    amount: i64,
-    payload: Vec<u8>,
-}
-
-#[derive(Debug, PartialEq)]
-enum Response {
-    Done,
-    Rows(Vec<Record>),
-    Thread(ThreadId),
-}
-
-#[derive(Debug, PartialEq)]
-enum OperationError {
-    Sqlite(String),
-    Insufficient,
-}
-
-impl From<rusqlite::Error> for OperationError {
-    fn from(error: rusqlite::Error) -> Self {
-        Self::Sqlite(error.to_string())
-    }
-}
-
-fn handle(connection: &mut Connection, request: Request) -> Result<Response, OperationError> {
-    match request {
-        Request::Insert(amount, payload) => {
-            connection.execute("INSERT INTO ledger VALUES (?, ?)", params![amount, payload])?;
-            Ok(Response::Done)
-        }
-        Request::Debit(amount) => {
-            let transaction = connection.transaction()?;
-            let balance: i64 =
-                transaction.query_row("SELECT SUM(amount) FROM ledger", [], |row| row.get(0))?;
-            transaction.execute(
-                "INSERT INTO ledger VALUES (?, ?)",
-                params![-amount, Vec::<u8>::new()],
-            )?;
-            if amount > balance {
-                return Err(OperationError::Insufficient);
-            }
-            transaction.commit()?;
-            Ok(Response::Done)
-        }
-        Request::Rows => {
-            let mut statement =
-                connection.prepare("SELECT amount, payload FROM ledger ORDER BY rowid")?;
-            let rows = statement
-                .query_map([], |row| {
-                    Ok(Record {
-                        amount: row.get(0)?,
-                        payload: row.get(1)?,
-                    })
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(Response::Rows(rows))
-        }
-        Request::Thread => Ok(Response::Thread(thread::current().id())),
-        Request::Block(entered, release) => {
-            entered.send(()).unwrap();
-            release.recv().unwrap();
-            Ok(Response::Done)
-        }
-        Request::CommitThenPanic => {
-            connection.execute("INSERT INTO ledger VALUES (42, X'')", [])?;
-            panic!("response lost after commit");
-        }
-    }
-}
-
-type Database = NativeDatabase<Request, Response, OperationError>;
-
-async fn database(capacity: Option<usize>) -> (Database, Client) {
+async fn database(capacity: Option<usize>) -> Client {
     let builder = match capacity {
         Some(capacity) => ClientBuilder::new().queue_capacity(capacity),
         None => ClientBuilder::new(),
     };
     let client = builder.open().await.unwrap();
     client
-        .conn(|connection| {
-            connection.execute_batch(
-                "CREATE TABLE ledger (amount INTEGER NOT NULL, payload BLOB NOT NULL)",
-            )
-        })
+        .execute_batch("CREATE TABLE ledger (amount INTEGER, payload BLOB)")
         .await
         .unwrap();
-    (NativeDatabase::new(client.clone(), handle), client)
+    client
 }
 
-fn send_sync<T: Send + Sync>() {}
 fn send_future<T: Send>(future: T) -> T {
     future
 }
 
-fn block(
-    database: &Database,
-) -> (
-    BoxFuture<'_, Result<Response, CallError<OperationError>>>,
-    mpsc::Sender<()>,
-) {
+fn block(client: &Client) -> (BoxFuture<'_, Result<(), Error>>, mpsc::Sender<()>) {
     let (entered, started) = mpsc::channel();
     let (release, wait) = mpsc::channel();
-    let mut running = database.call(Request::Block(entered, wait));
+    let mut running = client
+        .conn(move |_| {
+            entered.send(()).unwrap();
+            wait.recv().unwrap();
+            Ok(())
+        })
+        .boxed();
     assert!(running.as_mut().now_or_never().is_none());
     started.recv().unwrap();
     (running, release)
 }
 
 #[test]
-fn handler_runs_on_connection_thread_with_send_futures() {
+fn query_maps_on_caller_without_a_registered_handler() {
     smol::block_on(async {
-        send_sync::<Database>();
-        let (database, _) = database(None).await;
-        let response = send_future(database.call(Request::Thread)).await.unwrap();
-        assert_ne!(response, Response::Thread(thread::current().id()));
-        send_future(database.close()).await.unwrap();
-    });
-}
-
-#[test]
-fn conditional_transaction_commits_or_rolls_back_as_a_unit() {
-    smol::block_on(async {
-        let (database, _) = database(None).await;
-        database
-            .call(Request::Insert(20, vec![0, 128, 255]))
+        let client = database(None).await;
+        let caller = thread::current().id();
+        assert_ne!(
+            client.conn(|_| Ok(thread::current().id())).await.unwrap(),
+            caller
+        );
+        let expected = String::from("stored value");
+        client
+            .execute("INSERT INTO ledger VALUES (?, ?)", params![1, expected])
             .await
             .unwrap();
-        database.call(Request::Debit(7)).await.unwrap();
+        let result = send_future(client.query_row(
+            "SELECT payload FROM ledger WHERE amount=?",
+            [1],
+            |row| {
+                assert_eq!(thread::current().id(), caller);
+                assert_eq!(row.get::<String>(0)?, expected);
+                row.get::<String>(0)
+            },
+        ))
+        .await
+        .unwrap();
+        assert_eq!(result, expected);
+        let local = send_future(client.query_row("SELECT 'local'", [], |row| {
+            Ok(Rc::new(row.get::<String>(0)?))
+        }))
+        .await
+        .unwrap();
+        assert_eq!(*local, "local");
+        client.close().await.unwrap();
+    });
+}
+
+#[test]
+fn scalar_values_and_named_columns_survive_owned_rows() {
+    smol::block_on(async {
+        let client = database(None).await;
+        let blob = vec![0, 255, 128];
+        for value in [
+            i64::MIN,
+            -9_007_199_254_740_993,
+            9_007_199_254_740_993,
+            i64::MAX,
+        ] {
+            send_future(client.execute("INSERT INTO ledger VALUES (?, ?)", params![value, blob]))
+                .await
+                .unwrap();
+        }
+        let rows = client
+            .query_map(
+                "SELECT amount, payload FROM ledger ORDER BY rowid",
+                [],
+                |row| Ok((row.get_named::<i64>("amount")?, row.get::<Vec<u8>>(1)?)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows,
+            [
+                i64::MIN,
+                -9_007_199_254_740_993,
+                9_007_199_254_740_993,
+                i64::MAX
+            ]
+            .into_iter()
+            .map(|value| (value, blob.clone()))
+            .collect::<Vec<_>>()
+        );
+        let scalars = client
+            .query_row(
+                "SELECT ?, ?, ?, ?",
+                params![None::<i64>, 1.25, "", Vec::<u8>::new()],
+                |row| {
+                    Ok((
+                        row.get::<Option<i64>>(0)?,
+                        row.get::<f64>(1)?,
+                        row.get::<String>(2)?,
+                        row.get::<Vec<u8>>(3)?,
+                    ))
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(scalars, (None, 1.25, String::new(), vec![]));
+        client.close().await.unwrap();
+    });
+}
+
+#[test]
+fn query_row_does_not_evaluate_later_rows() {
+    smol::block_on(async {
+        let client = database(None).await;
+        let sql = "SELECT 1 UNION ALL SELECT abs(-9223372036854775808)";
+        assert_eq!(
+            client
+                .query_row(sql, [], |row| row.get::<i64>(0))
+                .await
+                .unwrap(),
+            1
+        );
         assert!(matches!(
-            database.call(Request::Debit(50)).await,
-            Err(CallError::Operation(OperationError::Insufficient))
+            client.query_map(sql, [], |row| row.get::<i64>(0)).await,
+            Err(Error::Rusqlite(_))
+        ));
+        client.close().await.unwrap();
+    });
+}
+
+#[test]
+fn batches_rollback_failed_or_unfinished_transactions() {
+    smol::block_on(async {
+        let client = database(None).await;
+        client
+            .execute_batch("BEGIN; INSERT INTO ledger VALUES (1, X'01'); COMMIT")
+            .await
+            .unwrap();
+        assert!(client.execute_batch("BEGIN; INSERT INTO ledger VALUES (2, X'02'); INSERT INTO missing VALUES (1); COMMIT").await.is_err());
+        assert!(client
+            .execute_batch("BEGIN; INSERT INTO ledger VALUES (3, X'03')")
+            .await
+            .is_err());
+        assert!(client.execute("BEGIN", []).await.is_err());
+        assert_eq!(
+            client
+                .query_map("SELECT amount FROM ledger", [], |row| row.get::<i64>(0))
+                .await
+                .unwrap(),
+            vec![1]
+        );
+        client
+            .execute("INSERT INTO ledger VALUES (4, X'04')", [])
+            .await
+            .unwrap();
+        client.close().await.unwrap();
+    });
+}
+
+#[test]
+fn query_and_conversion_errors_leave_connection_usable() {
+    smol::block_on(async {
+        let client = database(None).await;
+        assert!(matches!(
+            client
+                .query_row("SELECT amount FROM ledger", [], |row| row.get::<i64>(0))
+                .await,
+            Err(Error::Rusqlite(rusqlite::Error::QueryReturnedNoRows))
+        ));
+        assert!(matches!(
+            client
+                .query_row("SELECT 'text'", [], |row| row.get::<i64>(0))
+                .await,
+            Err(Error::Rusqlite(rusqlite::Error::InvalidColumnType(..)))
+        ));
+        assert!(matches!(
+            client
+                .query_row("SELECT ?", [], |row| row.get::<i64>(0))
+                .await,
+            Err(Error::Rusqlite(rusqlite::Error::InvalidParameterCount(
+                0, 1
+            )))
         ));
         assert_eq!(
-            database.call(Request::Rows).await.unwrap(),
-            Response::Rows(vec![
-                Record {
-                    amount: 20,
-                    payload: vec![0, 128, 255]
-                },
-                Record {
-                    amount: -7,
-                    payload: vec![]
-                },
-            ])
+            client
+                .query_row("SELECT 1", [], |row| row.get::<i64>(0))
+                .await
+                .unwrap(),
+            1
         );
-        database.close().await.unwrap();
+        client.close().await.unwrap();
     });
 }
 
 #[test]
-fn cloned_handles_keep_queued_order_and_exact_values() {
+fn accepted_sql_survives_cancellation_but_unpolled_sql_does_not_run() {
     smol::block_on(async {
-        let (database, _) = database(None).await;
-        let clone = database.clone();
-        let (running, release) = block(&database);
-        let mut first = database.call(Request::Insert(i64::MAX, vec![0, 255]));
-        let mut second = clone.call(Request::Insert(i64::MIN, vec![128]));
-        assert!(first.as_mut().now_or_never().is_none());
-        assert!(second.as_mut().now_or_never().is_none());
-        release.send(()).unwrap();
-        running.await.unwrap();
-        assert_eq!(
-            futures_util::join!(first, second),
-            (Ok(Response::Done), Ok(Response::Done))
-        );
-        assert_eq!(
-            database.call(Request::Rows).await.unwrap(),
-            Response::Rows(vec![
-                Record {
-                    amount: i64::MAX,
-                    payload: vec![0, 255]
-                },
-                Record {
-                    amount: i64::MIN,
-                    payload: vec![128]
-                },
-            ])
-        );
-        clone.close().await.unwrap();
-    });
-}
-
-#[test]
-fn dropping_an_admitted_call_does_not_cancel_its_write() {
-    smol::block_on(async {
-        let (database, _) = database(None).await;
-        let (running, release) = block(&database);
-        let mut abandoned = database.call(Request::Insert(9, vec![1]));
-        assert!(abandoned.as_mut().now_or_never().is_none());
-        drop(abandoned);
-        release.send(()).unwrap();
-        running.await.unwrap();
-        assert_eq!(
-            database.call(Request::Rows).await.unwrap(),
-            Response::Rows(vec![Record {
-                amount: 9,
-                payload: vec![1]
-            },])
-        );
-        database.close().await.unwrap();
-    });
-}
-
-#[test]
-fn dropping_an_unpolled_call_does_not_dispatch_it() {
-    smol::block_on(async {
-        let (database, _) = database(None).await;
-        drop(database.call(Request::Insert(9, vec![])));
-        assert_eq!(
-            database.call(Request::Rows).await,
-            Ok(Response::Rows(vec![]))
-        );
-        database.close().await.unwrap();
-    });
-}
-
-#[test]
-fn close_drains_admitted_work_and_survives_dropped_waiter() {
-    smol::block_on(async {
-        let (database, client) = database(None).await;
-        let (running, release) = block(&database);
-        let mut accepted = database.call(Request::Insert(9, vec![]));
+        let client = database(None).await;
+        let (running, release) = block(&client);
+        let mut accepted = Box::pin(client.execute("INSERT INTO ledger VALUES (?, X'')", [1]));
         assert!(accepted.as_mut().now_or_never().is_none());
-        let mut closing = database.close();
+        drop(accepted);
+        drop(client.execute("INSERT INTO ledger VALUES (?, X'')", [2]));
+        release.send(()).unwrap();
+        running.await.unwrap();
+        assert_eq!(
+            client
+                .query_map("SELECT amount FROM ledger", [], |row| row.get::<i64>(0))
+                .await
+                .unwrap(),
+            vec![1]
+        );
+        client.close().await.unwrap();
+    });
+}
+
+#[test]
+fn close_drains_accepted_sql_and_survives_a_dropped_waiter() {
+    smol::block_on(async {
+        let client = database(None).await;
+        let clone = client.clone();
+        let (running, release) = block(&client);
+        let mut accepted = Box::pin(client.execute("INSERT INTO ledger VALUES (?, X'')", [1]));
+        assert!(accepted.as_mut().now_or_never().is_none());
+        let mut closing = Box::pin(send_future(client.close()));
         assert!(closing.as_mut().now_or_never().is_none());
         drop(closing);
         assert!(matches!(
-            database.call(Request::Rows).await,
-            Err(CallError::NotDispatched(_))
+            clone
+                .execute("INSERT INTO ledger VALUES (?, X'')", [2])
+                .await,
+            Err(Error::Closed)
         ));
-        let mut first_waiter = database.close();
-        let mut second_waiter = database.close();
-        assert!(first_waiter.as_mut().now_or_never().is_none());
-        assert!(second_waiter.as_mut().now_or_never().is_none());
         release.send(()).unwrap();
         running.await.unwrap();
-        assert_eq!(accepted.await.unwrap(), Response::Done);
-        assert_eq!(
-            futures_util::join!(first_waiter, second_waiter),
-            (Ok(()), Ok(()))
-        );
-        database.close().await.unwrap();
-        assert!(matches!(
-            client.conn(|_| Ok(())).await,
-            Err(async_sqlite::Error::Closed)
-        ));
+        assert_eq!(accepted.await.unwrap(), 1);
+        let (first, second) = futures_util::join!(client.close(), clone.close());
+        first.unwrap();
+        second.unwrap();
+        assert!(matches!(client.conn(|_| Ok(())).await, Err(Error::Closed)));
     });
 }
 
 #[test]
-fn external_shutdown_does_not_strand_an_admitted_close() {
+fn full_queue_rejects_sql_without_latching_close() {
     smol::block_on(async {
-        let (database, client) = database(None).await;
-        let (running, release) = block(&database);
-        let mut external = Box::pin(client.close());
-        assert!(external.as_mut().now_or_never().is_none());
-        let mut closing = database.close();
-        assert!(closing.as_mut().now_or_never().is_none());
+        let client = database(Some(1)).await;
+        let (running, release) = block(&client);
+        let mut accepted = Box::pin(client.execute("INSERT INTO ledger VALUES (?, X'')", [1]));
+        assert!(accepted.as_mut().now_or_never().is_none());
+        assert!(matches!(
+            client
+                .execute("INSERT INTO ledger VALUES (?, X'')", [2])
+                .await,
+            Err(Error::QueueFull)
+        ));
+        assert!(matches!(client.close().await, Err(Error::QueueFull)));
         release.send(()).unwrap();
         running.await.unwrap();
-        external.await.unwrap();
-        let result = smol::future::race(closing, async {
-            smol::Timer::after(std::time::Duration::from_secs(1)).await;
-            Err(CallError::NotDispatched(
-                "close completion was stranded".into(),
-            ))
-        })
-        .await;
-        assert!(matches!(result, Err(CallError::OutcomeUnknown(_))));
-        database.close().await.unwrap();
-    });
-}
-
-#[test]
-fn full_queue_rejects_dispatch_and_does_not_latch_close() {
-    smol::block_on(async {
-        let (database, _) = database(Some(1)).await;
-        let (running, release) = block(&database);
-        let mut queued = database.call(Request::Insert(1, vec![]));
-        assert!(queued.as_mut().now_or_never().is_none());
-        assert!(matches!(
-            database.call(Request::Rows).await,
-            Err(CallError::NotDispatched(_))
-        ));
-        assert!(matches!(
-            database.close().await,
-            Err(CallError::NotDispatched(_))
-        ));
-        release.send(()).unwrap();
-        running.await.unwrap();
-        queued.await.unwrap();
+        accepted.await.unwrap();
         assert_eq!(
-            database.call(Request::Rows).await.unwrap(),
-            Response::Rows(vec![Record {
-                amount: 1,
-                payload: vec![]
-            },])
+            client
+                .query_map("SELECT amount FROM ledger", [], |row| row.get::<i64>(0))
+                .await
+                .unwrap(),
+            vec![1]
         );
-        database.close().await.unwrap();
-    });
-}
-
-#[test]
-fn panic_after_commit_reports_unknown_outcome_without_replaying() {
-    smol::block_on(async {
-        let (database, _) = database(None).await;
-        assert!(matches!(
-            database.call(Request::CommitThenPanic).await,
-            Err(CallError::OutcomeUnknown(_))
-        ));
-        assert_eq!(
-            database.call(Request::Rows).await.unwrap(),
-            Response::Rows(vec![Record {
-                amount: 42,
-                payload: vec![]
-            },])
-        );
-        database.close().await.unwrap();
+        client.close().await.unwrap();
     });
 }
